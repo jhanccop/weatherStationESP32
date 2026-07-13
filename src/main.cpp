@@ -1,0 +1,2140 @@
+/*
+ * ============================================================================
+ * WEATHER STATION - ESP32 Dev Module
+ * ============================================================================
+ * Version: PRODUCTION 26-06-2026 - HARDWARE SIM800
+ * Hardware: ESP32 Dev Module + SIM800 (Serial2) + DHT22 + MT6701/AS5600 (I2C) +
+ *           SD card (VSPI) + anemómetro de pulsos + pluviómetro (interrupción)
+ *
+ * Mapa de pines:
+ *   SIM800   : RX2=16 (recibe del TX del modem) / TX2=17 (transmite al RX del modem)
+ *              Alimentación controlada por MOSFET canal P en GPIO15 (LOW=ON, HIGH=OFF)
+ *   Sensores : Alimentación controlada por MOSFET canal P en GPIO2/D2 (LOW=ON, HIGH=OFF)
+ *   SD card  : MISO=19 MOSI=23 SCK=18 CS=5 (coincide con el bus VSPI por defecto del ESP32)
+ *   Lluvia   : GPIO39 (entrada solo, sin pull interno) - wakeup por EXT1
+ *   Viento   : GPIO13/D13 (velocidad por pulsos), MT6701 o AS5600 por I2C (SDA=21/SCL=22)
+ *              para dirección — se elige por software (dirSensorType, /dirSensor.txt)
+ *   DHT      : GPIO4 (DHT22)
+ *   Batería  : GPIO34 (ADC), divisor 100k/100k
+ *   Botón AP : GPIO36 (modo configuración si está en LOW al arrancar).
+ *              Entrada solo-lectura SIN pull interno: requiere resistencia
+ *              pull-up EXTERNA a 3.3V; el botón conecta a GND al presionarlo.
+ */
+
+#define ARDUINOJSON_STRING_LENGTH_SIZE 4
+
+#include <driver/rtc_io.h>
+#include <SPIFFS.h>
+#include <ArduinoJson.h>
+#include <esp_sleep.h>
+
+#include "soc/rtc.h"
+
+/* ====================== I2C BUS (MT6701) ======================== */
+#include <Wire.h>
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+/* ====================== WIND DIRECTION SENSOR (MT6701 or AS5600) ======================== */
+// Ambos son encoders magnéticos I2C intercambiables para leer la dirección del viento.
+// dirSensorType ("MT6701"/"AS5600", persistido en /dirSensor.txt) selecciona cuál se usa
+// en tiempo de ejecución; solo el módulo elegido se inicializa/lee.
+#include "MT6701.h"
+#include <AS5600.h>
+MT6701 encoder;
+AS5600 as5600;
+String dirSensorType = "MT6701";
+
+/* ====================== DHT22 TEMP/HUM SETTINGS ======================== */
+#include <DHT.h>
+#define DHT_PIN  4
+#define DHT_TYPE DHT21   // AM2301 = DHT21
+DHT dht(DHT_PIN, DHT_TYPE);
+
+/* ====================== SD CARD SETTINGS (VSPI) ======================== */
+#include <SPI.h>
+#include <SD.h>
+#define SD_MISO 19
+#define SD_MOSI 23
+#define SD_SCK  18
+#define SD_CS   5
+
+bool sdReady = false;
+String sdCardType = "N/A";
+uint64_t sdTotalMB = 0;
+uint64_t sdUsedMB = 0;
+uint64_t sdFreeMB = 0;
+
+/* ====================== WEBSERVER SETTINGS ======================== */
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+
+volatile bool serverReady = false;
+
+AsyncWebServer server(80);
+
+const char* ssid = "WeatherStation_config";
+const char* password = "12345678";
+
+String RUNssid = "";
+String RUNpass = "";
+
+/* ============================== SIM800 CONFIGURATIONS ============================== */
+#define TINY_GSM_MODEM_SIM800
+#define TINY_GSM_RX_BUFFER 1024
+
+#define SerialMon Serial
+#define SerialAT Serial2
+#define TINY_GSM_DEBUG SerialMon
+#define TINY_GSM_USE_GPRS true
+#define TINY_GSM_USE_WIFI false
+#define GSM_PIN ""
+
+const char apn[]      = "claro.pe";
+const char gprsUser[] = "";
+const char gprsPass[] = "";
+
+#include <TinyGsmClient.h>
+#include "FS.h"
+
+#ifdef DUMP_AT_COMMANDS
+  #include <StreamDebugger.h>
+  StreamDebugger debugger(SerialAT, SerialMon);
+  TinyGsm modem(debugger);
+#else
+  TinyGsm modem(SerialAT);
+#endif
+
+// ESP32 Dev Module pinout
+#define UART_BAUD           9600
+#define PIN_RX2             16
+#define PIN_TX2             17
+#define MODEM_PWR_PIN       15   // MOSFET canal P: LOW=ON, HIGH=OFF
+
+#define SENS_PWR_PIN        2    // MOSFET canal P: LOW=ON, HIGH=OFF (ctrl-sensors, D2 en esquemático)
+#define LED_PIN             12
+
+/* ============================== DEVICE CONFIGURATIONS ============================== */
+
+uint64_t uS_TO_S_FACTOR = 1000000UL;
+uint64_t TIME_TO_SLEEP = 60;
+unsigned long previousTime = 0;
+boolean status = false;
+
+RTC_DATA_ATTR uint64_t cycle_start_rtc = 0;
+RTC_DATA_ATTR bool cycle_active = false;
+
+// Ticks RTC (no segundos, para resolución sub-segundo) del último pulso de
+// lluvia contado como válido; persistido a través del deep sleep para
+// exigir una separación física mínima entre vaciadas reales (ver
+// runRainCounter()).
+RTC_DATA_ATTR uint64_t lastRainPulseRtcTicks = 0;
+
+// Marca de tiempo RTC (no persistida, se recaptura en cada boot/wake) del
+// inicio de este ciclo despierto. Se usa en deepSleepSystem() para restar
+// el tiempo de procesamiento (modem, sensores, MQTT) del próximo sleep y
+// así evitar el desfase acumulado en el período configurado.
+uint64_t bootRtcSeconds = 0;
+
+/* Device settings */
+boolean A_TH = false;
+boolean A_WS = false;
+boolean A_PR = false;
+
+const char* PARAM_SSID = "ssidString";
+const char* PARAM_PASS = "passString";
+const char* PARAM_SERVER = "server";
+const char* PARAM_PORT = "port";
+const char* PARAM_RESET = "reset";
+const char* PARAM_CONN_TYPE = "connType";
+
+/* ====================== MQTT ======================== */
+const char *broker = "broker.hivemq.com"; //24.199.125.52
+const int mqtt_port = 1883;
+const char *topicSubscribe = "jhpAI/FAUNA/settings";
+const char *topicPublish = "jhpAI/FAUNA/data";
+
+#include <PubSubClient.h>
+TinyGsmClient client(modem);
+PubSubClient simclient(client);
+
+WiFiClient espClient;
+PubSubClient wificlient(espClient);
+
+/* ====================== DEVICE SETTINGS ======================== */
+#define pinBattery        34   // ADC1_CH6, divisor 100k/100k
+#define pinWindVelocity   13
+#define pinConfigAP       36
+#define RAINCOUNT         GPIO_NUM_39  // INPUT-ONLY PIN - NO INTERNAL PULLUP
+#define RAINCOUNT_MASK    (1ULL << 39)
+
+// Anemómetro: sensor Hall SS451A, 2 imanes a 180° = 2 pulsos/vuelta.
+// V(m/s) = (pulsos/2) * 2*pi*radio / tiempo * factor_calibracion
+#define WIND_RADIUS_M          0.079   // distancia centro-copa
+#define WIND_CAL_FACTOR         2.64   // factor empírico (túnel de viento)
+#define WIND_SPEED_PER_PULSE   (TWO_PI * WIND_RADIUS_M * WIND_CAL_FACTOR / 2.0)  // m/s por (pulso/segundo)
+// Con las copas detenidas y un imán justo sobre el sensor, el campo puede
+// quedar en el borde del umbral del comparador y generar parpadeo eléctrico
+// (chatter) en vez de una salida LOW estable: se ven flancos de bajada
+// repetidos sin que haya rotación real. MAX_WIND_SPEED_MS descarta como
+// ruido cualquier lectura por encima de lo físicamente plausible para este
+// anemómetro, y WIND_PULSE_DEBOUNCE_US exige una separación mínima entre
+// pulsos válidos (permite hasta ~82 m/s, muy por encima de lo esperado).
+#define MAX_WIND_SPEED_MS      75.0
+#define WIND_PULSE_DEBOUNCE_US 8000UL
+#define RAIN_MM_PER_TIP   0.0355  // pluviometro balancin: 4.5 ml/volcado, colector de 12.7 cm diametro
+
+// El pluviómetro también usa un sensor Hall (igual que el viento): medido
+// con multímetro, sin campo magnético da ~2.3V y con campo da ~21mV. El
+// nivel "sin campo" (2.3V) queda peligrosamente cerca del umbral de
+// entrada digital del ESP32 (~2.45-2.6V para lógica de 3.3V), así que
+// leer el pin como digital (HIGH/LOW) dispara falsos positivos por ruido
+// aun estando en reposo. En vez de depender de ese umbral fijo, se lee el
+// voltaje real por ADC y se decide con histéresis propia, aprovechando
+// que la separación real entre ambos niveles (2.3V vs 21mV) es enorme.
+#define RAIN_ADC_FIELD_MV   500   // por debajo: campo magnético presente (imán encima)
+#define RAIN_ADC_IDLE_MV   1500   // por encima: sin campo (reposo). Entre 500-1500mV: zona muerta, se ignora
+#define RAIN_PULSE_MIN_INTERVAL_MS 300  // el balancín no puede vaciarse dos veces más rápido que esto
+
+String connectionType = "";
+
+// Contador de pulsos de lluvia en vivo (modo config); definido más abajo,
+// declarado aquí para que setupServerRoutes() pueda reiniciarlo.
+extern volatile unsigned long rainPulseCountISR;
+
+/* ====================== SENSOR CACHE ======================== */
+struct {
+  String temp = "--", hum  = "--";
+  String rain = "--", wvel = "--", wdir = "--", bat = "--";
+  String rainStatus = "--", rainCount = "--";
+} sensCache;
+
+/* ====================== HTML PAGE ======================== */
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML>
+<html>
+<head>
+<title>Weather Station</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="UTF-8">
+<link rel="icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAxMDAgMTAwJz48dGV4dCB5PScuOWVtJyBmb250LXNpemU9JzkwJz7im4U8L3RleHQ+PC9zdmc+">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:Arial,sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);padding:10px;min-height:100vh}
+.c{max-width:700px;margin:0 auto;background:#fff;padding:20px;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.25)}
+h2{color:#2c3e50;margin-bottom:4px;text-align:center;font-size:22px}
+.offline{text-align:center;font-size:11px;color:#7f8c8d;margin-bottom:15px;letter-spacing:.3px}
+.offline .dot{display:inline-block;width:7px;height:7px;border-radius:50%%;background:#28a745;margin-right:5px;box-shadow:0 0 0 3px rgba(40,167,69,.2)}
+.i{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;padding:12px;border-radius:8px;margin-bottom:15px;text-align:center;font-size:13px;font-weight:500}
+.tb{display:flex;gap:10px;margin-bottom:15px}
+.tb>*{flex:1}
+.btn{display:flex;align-items:center;justify-content:center;gap:6px;padding:12px 16px;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;transition:all .2s;text-transform:uppercase}
+.br{background:linear-gradient(135deg,#28a745,#20c997);color:#fff;box-shadow:0 4px 15px rgba(40,167,69,.3)}
+.br:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(40,167,69,.4)}
+.be{background:linear-gradient(135deg,#dc3545,#c82333);color:#fff;box-shadow:0 4px 15px rgba(220,53,69,.3)}
+.be:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(220,53,69,.4)}
+.s{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:15px}
+.sb{background:#fff;border:2px solid #e8e8e8;padding:12px 8px;border-radius:10px;text-align:center;transition:all .2s}
+.sb:hover{border-color:#667eea;box-shadow:0 4px 12px rgba(102,126,234,.2)}
+.sv{font-size:20px;font-weight:700;margin:6px 0;color:#2c3e50}
+.sl{font-size:11px;color:#7f8c8d;text-transform:uppercase;letter-spacing:.5px}
+.sc{background:#f8f9fa;padding:15px;margin:12px 0;border-radius:10px;border-left:4px solid #667eea}
+.sc h3{color:#2c3e50;margin-bottom:10px;font-size:14px;display:flex;align-items:center;gap:6px}
+label{display:block;margin:8px 0;cursor:pointer;font-size:13px;color:#2c3e50;padding:8px;background:#fff;border-radius:6px;transition:background .2s}
+label:hover{background:#f0f0f0}
+input[type=checkbox]{margin-right:8px;width:16px;height:16px;vertical-align:middle;accent-color:#667eea}
+input[type=text],select{width:100%%;padding:10px;margin:4px 0 8px;border:2px solid #e0e0e0;border-radius:6px;font-size:13px;transition:border .2s}
+input[type=text]:focus,select:focus{outline:none;border-color:#667eea}
+input[type=submit]{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;padding:10px 15px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;width:100%%;transition:all .2s}
+input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(102,126,234,.3)}
+.fr{margin:8px 0}
+.fr label{background:0;padding:0;margin-bottom:4px;font-weight:600}
+.fr label:hover{background:0}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.ps{font-size:11px;color:#888;margin-top:4px}
+.rc{background:#fff;border:2px solid #e8e8e8;border-radius:10px;padding:12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
+.rc .sv{margin:0;font-size:24px}
+@media(max-width:600px){.s{grid-template-columns:repeat(2,1fr)}.g2{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="c">
+<h2>&#x26C5; Weather Station</h2>
+<div class="offline"><span class="dot"></span>Modo Punto de Acceso — standalone, sin conexión a internet</div>
+<div class="i"><b>MAC:</b> %MAC% | <b>Bat:</b> <span id="bat">--</span>V</div>
+
+<div class="tb">
+<button class="btn br" onclick="location.reload()">&#x21bb; Actualizar</button>
+<form action="/get"><input type="hidden" name="reset" value="1"><button type="submit" class="btn be">&#x2714; Guardar y Salir</button></form>
+</div>
+
+<div class="sc">
+<h3>&#x1F4CA; Lecturas en Tiempo Real</h3>
+<div class="s">
+<div class="sb"><div class="sl">&#x1F321; Temp</div><div class="sv" id="temp">--</div></div>
+<div class="sb"><div class="sl">&#x1F4A7; Humedad</div><div class="sv" id="hum">--</div></div>
+<div class="sb"><div class="sl">&#x1F327; Lluvia</div><div class="sv" id="rain">--</div></div>
+<div class="sb"><div class="sl">&#x2601; Estado Lluvia</div><div class="sv" id="rainStatus">--</div></div>
+<div class="sb"><div class="sl">&#x1F4A8; Vel. Viento</div><div class="sv" id="wvel">--</div></div>
+<div class="sb"><div class="sl">&#x1F9ED; Dir. Viento</div><div class="sv" id="wdir">--</div></div>
+</div>
+<div class="ps">Última actualización: <span id="upd">--</span> (cada 1 s, local)</div>
+</div>
+<div class="sc">
+<h3>&#x1F6E0; Sensores</h3>
+<form action="/get">
+<label><input type="checkbox" name="A_TH" value="1" %A_TH_CHECKED%>Temperatura y Humedad (DHT22)</label>
+<label><input type="checkbox" name="A_PR" value="1" %A_PR_CHECKED%>Precipitación</label>
+<label><input type="checkbox" name="A_WS" value="1" %A_WS_CHECKED%>Velocidad y Dirección del Viento</label>
+<input type="submit" value="Guardar Sensores">
+</form>
+<form action="/get">
+<label>Módulo de Dirección (Viento)</label>
+<select name="dirSensor">
+<option value="MT6701" %MT6701_SELECTED%>MT6701 (encoder magnético)</option>
+<option value="AS5600" %AS5600_SELECTED%>AS5600 (brújula magnética)</option>
+</select>
+<input type="submit" value="Guardar Módulo">
+</form>
+<div class="rc">
+<div><div class="sl">&#x1F327; Vaciadas acumuladas</div><div class="sv" id="rainCounterVal">--</div></div>
+<form action="/get">
+<input type="hidden" name="resetRain" value="1">
+<button type="submit" class="btn be">&#x21bb; Reiniciar</button>
+</form>
+</div>
+<div class="ps">Total persistente en memoria: no se reinicia solo en cada reporte, únicamente con el botón de arriba.</div>
+</div>
+<div class="sc">
+<h3>&#x23F1; Período de Muestreo</h3>
+<form action="/get">
+<select name="period">
+<option value="120" %P120%>2 min (120 seg)</option>
+<option value="300" %P300%>5 min (300 seg)</option>
+<option value="900" %P900%>15 min (900 seg)</option>
+<option value="1800" %P1800%>30 min (1800 seg)</option>
+<option value="3600" %P3600%>1 hora (3600 seg)</option>
+<option value="7200" %P7200%>2 horas (7200 seg)</option>
+</select>
+<div class="ps">Tiempo actual: %PERIOD_SEC% segundos (%PERIOD_MIN% min)</div>
+<input type="submit" value="Guardar Período">
+</form>
+</div>
+
+<div class="sc">
+<h3>&#x1F4BE; Tarjeta SD</h3>
+<div class="s">
+<div class="sb"><div class="sl">Estado</div><div class="sv">%SD_PRESENT%</div></div>
+<div class="sb"><div class="sl">Tipo</div><div class="sv">%SD_TYPE%</div></div>
+<div class="sb"><div class="sl">Total</div><div class="sv">%SD_TOTAL% MB</div></div>
+<div class="sb"><div class="sl">Usado</div><div class="sv">%SD_USED% MB</div></div>
+<div class="sb"><div class="sl">Libre</div><div class="sv">%SD_FREE% MB</div></div>
+</div>
+</div>
+
+<div class="sc" id="lteCard" style="%LTE_CARD_STYLE%">
+<h3>&#x1F4E1; Diagnóstico LTE (SIM800)</h3>
+<button type="button" class="btn br" style="width:100%%;margin-bottom:10px" onclick="lteTest()">&#x1F4E1; Probar Conexión</button>
+<div id="lteResult" class="ps">Sin ejecutar aún. El modem se enciende solo al presionar el botón.</div>
+</div>
+
+<div class="sc">
+<h3>&#x1F4F6; Conexión</h3>
+<form action="/get">
+<select name="connType">
+<option value="WIFI" %WIFI_SELECTED%>WiFi</option>
+<option value="LTE" %LTE_SELECTED%>LTE</option>
+</select>
+<input type="submit" value="Guardar">
+</form>
+<div class="g2">
+<form action="/get"><div class="fr"><label>SSID</label><input type="text" name="ssidString" value="%ssidString%"></div><input type="submit" value="Guardar"></form>
+<form action="/get"><div class="fr"><label>Password</label><input type="text" name="passString" value="%passString%"></div><input type="submit" value="Guardar"></form>
+</div>
+</div>
+<div class="sc">
+<h3>&#x1F4E1; Servidor MQTT</h3>
+<div class="g2">
+<form action="/get"><div class="fr"><label>IP</label><input type="text" name="server" value="%server%"></div><input type="submit" value="Guardar"></form>
+<form action="/get"><div class="fr"><label>Puerto</label><input type="text" name="port" value="%port%"></div><input type="submit" value="Guardar"></form>
+</div>
+<form action="/get"><div class="fr"><label>Topic Publish</label><input type="text" name="topicPub" value="%topicPub%"></div><input type="submit" value="Guardar"></form>
+<form action="/get"><div class="fr"><label>Topic Subscribe</label><input type="text" name="topicSub" value="%topicSub%"></div><input type="submit" value="Guardar"></form>
+</div>
+</div>
+<script>
+function u(){fetch('/sensors').then(r=>r.json()).then(d=>{document.getElementById('temp').innerText=d.temp!='NA'?d.temp+'°C':'--';document.getElementById('hum').innerText=d.hum!='NA'?d.hum+'%%':'--';document.getElementById('rain').innerText=d.rain!='NA'?d.rain+' mm':'--';document.getElementById('rainStatus').innerText=d.rainStatus!='NA'?d.rainStatus:'--';document.getElementById('wvel').innerText=d.wvel!='NA'?d.wvel+' m/s':'--';document.getElementById('wdir').innerText=d.wdir!='NA'?d.wdir+'°':'--';document.getElementById('bat').innerText=d.bat||'--';var rc=document.getElementById('rainCounterVal');if(rc)rc.innerText=d.rainCount!='NA'?d.rainCount:'--';document.getElementById('upd').innerText=new Date().toLocaleTimeString();}).catch(e=>console.log(e));}
+u();setInterval(u,1000);
+function lteTest(){var r=document.getElementById('lteResult');r.innerText='Probando... (enciende el modem, puede tardar hasta 20 s)';fetch('/ltetest').then(r=>r.json()).then(d=>{var lines=[];if(d.modemInfo)lines.push('Modem: '+d.modemInfo);if(d.signal!=null)lines.push('Señal (CSQ): '+d.signal+(d.signal==99?' (desconocida)':''));if(d.simReady!=null)lines.push('SIM lista: '+(d.simReady?'sí':'no'));if(d.networkRegistered!=null)lines.push('Registrado en red: '+(d.networkRegistered?'sí':'no'));if(d.operator)lines.push('Operador: '+d.operator);if(d.gprsConnected!=null)lines.push('GPRS/Internet: '+(d.gprsConnected?'sí':'no'));if(d.ip)lines.push('IP: '+d.ip);lines.push(d.msg||(d.ok?'OK':'Error'));document.getElementById('lteResult').innerHTML=lines.join('<br>');}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;});}
+document.querySelectorAll('form').forEach(f=>{f.onsubmit=function(e){if(this.querySelector('input[name="resetRain"]')&&!confirm('¿Reiniciar el contador de lluvia a 0? Esta acción no se puede deshacer.')){e.preventDefault();return;}if(!this.querySelector('input[name="reset"]')){e.preventDefault();fetch('/get?'+new URLSearchParams(new FormData(this))).then(()=>location.href='/').catch(()=>location.href='/');}}});
+</script>
+</body>
+</html>)rawliteral";
+
+/*"*/
+
+/* ====================== FUNCTION PROTOTYPES ======================== */
+void notFound(AsyncWebServerRequest *request);
+String readFile(fs::FS &fs, const char *path);
+void writeFile(fs::FS &fs, const char *path, const char *message);
+void saveSetting(String value, String fil);
+String macA();
+String processor(const String& var);
+void deepSleepSystem();
+void setting();
+void setupServerRoutes();
+String vBat();
+void runRainCounter();
+void readDHT22(float &temperature, float &humidity, bool &success);
+float WindDirection();
+float WindVelocity();
+void modemPowerOn();
+void modemPowerOff();
+void modemRestart();
+void modemLinesOff();
+void callback(char *topic, byte *payload, unsigned int length);
+void wifiReconnect();
+void simReconnect();
+bool checkMQTT();
+void wakeup_reason();
+void init_running();
+void readConfig();
+void initDHT22();
+void initMT6701();
+void initSD();
+void logToSD(const String &line);
+void createDefaultConfigs();
+String readSensors();
+bool sendDataWiFi(String jsonData);
+bool sendDataLTE(String jsonData);
+uint64_t getRtcTimeSeconds();
+void updateSensCache();
+void waitForConfig(PubSubClient &mqttClient);
+
+/* ====================== HTML SCRIPTS ======================== */
+void notFound(AsyncWebServerRequest *request) {
+  Serial.print("NOT FOUND: ");
+  Serial.println(request->url());
+  request->send(404, "text/plain", "Not found");
+}
+
+/* ====================== FILE FUNCTIONS ======================== */
+String readFile(fs::FS &fs, const char *path) {
+  Serial.printf("[SPIFFS] Leyendo: %s\n", path);
+
+  if (!SPIFFS.exists(path)) {
+    Serial.printf("[SPIFFS] No existe: %s\n", path);
+    return String("");
+  }
+
+  File file = fs.open(path, FILE_READ);
+  if (!file) {
+    Serial.printf("[SPIFFS] Error abriendo: %s\n", path);
+    return String("");
+  }
+
+  if (file.isDirectory()) {
+    file.close();
+    return String("");
+  }
+
+  size_t size = file.size();
+  if (size == 0) {
+    file.close();
+    return String("");
+  }
+
+  char* buf = (char*)malloc(size + 1);
+  if (!buf) {
+    file.close();
+    return String("");
+  }
+
+  size_t bytesRead = file.readBytes(buf, size);
+  buf[bytesRead] = '\0';
+  file.close();
+
+  String fileContent = String(buf);
+  free(buf);
+  fileContent.trim();
+
+  return fileContent;
+}
+
+void writeFile(fs::FS &fs, const char *path, const char *message) {
+  File file = fs.open(path, "w");
+  if (!file) {
+    Serial.printf("[SPIFFS] Error escribiendo: %s\n", path);
+    return;
+  }
+  file.print(message);
+  file.close();
+}
+
+void saveSetting(String value, String fil) {
+  String orValue = readFile(SPIFFS, fil.c_str());
+  if (orValue != value) {
+    writeFile(SPIFFS, fil.c_str(), value.c_str());
+  }
+}
+
+String macA() {
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char macStr[18];
+  sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(macStr);
+}
+
+String processor(const String& var) {
+  if (var == "ssidString") {
+    return readFile(SPIFFS, "/ssidString.txt");
+  } else if (var == "passString") {
+    return readFile(SPIFFS, "/passString.txt");
+  } else if (var == "server") {
+    return readFile(SPIFFS, "/server.txt");
+  } else if (var == "port") {
+    return readFile(SPIFFS, "/port.txt");
+  } else if (var == "topicPub") {
+    return readFile(SPIFFS, "/topicPub.txt");
+  } else if (var == "topicSub") {
+    return readFile(SPIFFS, "/topicSub.txt");
+  } else if (var == "MAC") {
+    return macA();
+  } else if (var == "WIFI_SELECTED") {
+    String connType = readFile(SPIFFS, "/connType.txt");
+    return (connType == "WIFI" || connType == "") ? "selected" : "";
+  } else if (var == "LTE_SELECTED") {
+    String connType = readFile(SPIFFS, "/connType.txt");
+    return (connType == "LTE") ? "selected" : "";
+  } else if (var == "A_TH_CHECKED") {
+    return readFile(SPIFFS, "/A_TH.txt") == "1" ? "checked" : "";
+  } else if (var == "A_PR_CHECKED") {
+    return readFile(SPIFFS, "/A_PR.txt") == "1" ? "checked" : "";
+  } else if (var == "A_WS_CHECKED") {
+    return readFile(SPIFFS, "/A_WS.txt") == "1" ? "checked" : "";
+  } else if (var == "MT6701_SELECTED") {
+    String dirSensor = readFile(SPIFFS, "/dirSensor.txt");
+    return (dirSensor == "AS5600") ? "" : "selected";
+  } else if (var == "AS5600_SELECTED") {
+    String dirSensor = readFile(SPIFFS, "/dirSensor.txt");
+    return (dirSensor == "AS5600") ? "selected" : "";
+  } else if (var == "P120") {
+    return readFile(SPIFFS, "/timesleep.txt") == "120" ? "selected" : "";
+  } else if (var == "P300") {
+    return readFile(SPIFFS, "/timesleep.txt") == "300" ? "selected" : "";
+  } else if (var == "P900") {
+    return readFile(SPIFFS, "/timesleep.txt") == "900" ? "selected" : "";
+  } else if (var == "P1800") {
+    return readFile(SPIFFS, "/timesleep.txt") == "1800" ? "selected" : "";
+  } else if (var == "P3600") {
+    return readFile(SPIFFS, "/timesleep.txt") == "3600" ? "selected" : "";
+  } else if (var == "P7200") {
+    return readFile(SPIFFS, "/timesleep.txt") == "7200" ? "selected" : "";
+  } else if (var == "PERIOD_SEC") {
+    String val = readFile(SPIFFS, "/timesleep.txt");
+    return val != "" ? val : "300";
+  } else if (var == "PERIOD_MIN") {
+    String val = readFile(SPIFFS, "/timesleep.txt");
+    int sec = val != "" ? val.toInt() : 300;
+    return String(sec / 60);
+  } else if (var == "SD_PRESENT") {
+    return sdReady ? "Detectada" : "No detectada";
+  } else if (var == "SD_TYPE") {
+    return sdCardType;
+  } else if (var == "SD_TOTAL") {
+    return String((unsigned long)sdTotalMB);
+  } else if (var == "SD_USED") {
+    return String((unsigned long)sdUsedMB);
+  } else if (var == "SD_FREE") {
+    return String((unsigned long)sdFreeMB);
+  } else if (var == "LTE_CARD_STYLE") {
+    String connType = readFile(SPIFFS, "/connType.txt");
+    return (connType == "LTE") ? "" : "display:none";
+  }
+  return String();
+}
+
+/* ====================== SD CARD ======================== */
+void initSD() {
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS)) {
+    Serial.println("[SD] Error al montar la tarjeta SD");
+    sdReady = false;
+    sdCardType = "N/A";
+    sdTotalMB = sdUsedMB = sdFreeMB = 0;
+    return;
+  }
+
+  sdReady = true;
+
+  switch (SD.cardType()) {
+    case CARD_MMC:  sdCardType = "MMC";  break;
+    case CARD_SD:   sdCardType = "SDSC"; break;
+    case CARD_SDHC: sdCardType = "SDHC"; break;
+    default:        sdCardType = "Desconocido"; break;
+  }
+
+  sdTotalMB = SD.totalBytes() / (1024ULL * 1024ULL);
+  sdUsedMB  = SD.usedBytes()  / (1024ULL * 1024ULL);
+  sdFreeMB  = (sdTotalMB > sdUsedMB) ? (sdTotalMB - sdUsedMB) : 0;
+
+  Serial.printf("[SD] Tarjeta SD lista: tipo=%s total=%llu MB usado=%llu MB libre=%llu MB\n",
+                sdCardType.c_str(), sdTotalMB, sdUsedMB, sdFreeMB);
+}
+
+void logToSD(const String &line) {
+  if (!sdReady) return;
+  File f = SD.open("/datalog.txt", FILE_APPEND);
+  if (!f) {
+    Serial.println("[SD] Error abriendo /datalog.txt");
+    return;
+  }
+  f.println(line);
+  f.close();
+}
+
+/* ========================= DEEP SLEEP ========================= */
+
+void deepSleepSystem() {
+  Serial.println("\n[SLEEP] Preparando deep sleep...");
+
+  // ===== APAGAR SENSORES (MOSFET canal P, HIGH=OFF) =====
+  gpio_hold_dis((gpio_num_t)SENS_PWR_PIN);
+  pinMode(SENS_PWR_PIN, OUTPUT);
+  digitalWrite(SENS_PWR_PIN, HIGH);
+  gpio_hold_en((gpio_num_t)SENS_PWR_PIN);
+
+  // ===== APAGAR MODEM (MOSFET canal P, HIGH=OFF) =====
+  gpio_hold_dis((gpio_num_t)MODEM_PWR_PIN);
+  pinMode(MODEM_PWR_PIN, OUTPUT);
+  digitalWrite(MODEM_PWR_PIN, HIGH);
+  gpio_hold_en((gpio_num_t)MODEM_PWR_PIN);
+
+  // ===== RX2/TX2 a LOW (no flotando): evita retroalimentar el SIM800 por
+  // los pines UART mientras está sin alimentación. Incondicional: en modo
+  // WiFi el modem nunca se enciende, así que sin esto estos pines
+  // quedarían en su estado flotante por defecto durante todo el sleep.
+  modemLinesOff();
+
+  // ===== LED =====
+  gpio_hold_dis((gpio_num_t)LED_PIN);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);  // LED apagado en sleep
+  gpio_hold_en((gpio_num_t)LED_PIN);
+
+  // Leer tiempo de sleep
+  TIME_TO_SLEEP = readFile(SPIFFS, "/timesleep.txt").toInt();
+  if (TIME_TO_SLEEP < 60) TIME_TO_SLEEP = 300;
+
+  // Compensar el tiempo despierto (encender modem, leer sensores, publicar
+  // MQTT, esperar config) para que el período real entre wakeups por timer
+  // sea TIME_TO_SLEEP y no TIME_TO_SLEEP + tiempo despierto (causaba un
+  // desfase acumulado, p.ej. ~7 s cada 5 min). cycle_start_rtc marca el
+  // inicio real del ciclo (bootRtcSeconds), no el instante justo antes de
+  // dormir, para que runRainCounter() también calcule bien el restante si
+  // el sleep siguiente se corta por un pulso de lluvia.
+  uint64_t nowRtc = getRtcTimeSeconds();
+  uint64_t awakeSeconds = (nowRtc > bootRtcSeconds) ? (nowRtc - bootRtcSeconds) : 0;
+
+  cycle_start_rtc = bootRtcSeconds;
+  cycle_active = true;
+
+  uint64_t sleepSeconds = (awakeSeconds >= TIME_TO_SLEEP) ? 10 : (TIME_TO_SLEEP - awakeSeconds);
+  if (sleepSeconds < 10) sleepSeconds = 10;
+
+  Serial.printf("[SLEEP] Período: %d seg (%d min) - Despierto: %llu s - Durmiendo: %llu s\n",
+                TIME_TO_SLEEP, TIME_TO_SLEEP / 60, awakeSeconds, sleepSeconds);
+
+  // ===== HABILITAR HOLD DURANTE DEEP SLEEP =====
+  gpio_deep_sleep_hold_en();
+
+  // Configurar wake ups
+  esp_sleep_enable_timer_wakeup(sleepSeconds * uS_TO_S_FACTOR);
+
+  // habilita solo si esta activado el sensor de lluvia
+  if (A_PR) {
+    esp_sleep_enable_ext1_wakeup(RAINCOUNT_MASK, ESP_EXT1_WAKEUP_ALL_LOW);
+    Serial.println("[SLEEP] Wake por lluvia: HABILITADO");
+  } else {
+    Serial.println("[SLEEP] Wake por lluvia: DESHABILITADO");
+  }
+
+  Serial.println("[SLEEP] Entrando en deep sleep...\n");
+  Serial.flush();
+
+  esp_deep_sleep_start();
+}
+
+/* ====================== SETUP SERVER ROUTES ======================== */
+void setupServerRoutes() {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("[HTTP] Root requested");
+    request->send_P(200, "text/html", index_html, processor);
+  });
+
+  // Handler no bloqueante: sirve valores cacheados actualizados desde loop()
+  server.on("/sensors", HTTP_GET, [](AsyncWebServerRequest *request) {
+    StaticJsonDocument<256> doc;
+    doc["temp"] = sensCache.temp;
+    doc["hum"]  = sensCache.hum;
+    doc["rain"] = sensCache.rain;
+    doc["rainStatus"] = sensCache.rainStatus;
+    doc["rainCount"] = sensCache.rainCount;
+    doc["wvel"] = sensCache.wvel;
+    doc["wdir"] = sensCache.wdir;
+    doc["bat"]  = sensCache.bat;
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
+  // Diagnóstico LTE bajo demanda (bloqueante, botón manual): solo tiene
+  // sentido si connType=LTE, ya que enciende el modem SIM800 vía MOSFET.
+  server.on("/ltetest", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (connectionType != "LTE") {
+      request->send(400, "application/json", "{\"ok\":false,\"msg\":\"Modo LTE no seleccionado\"}");
+      return;
+    }
+
+    Serial.println("[LTE TEST] Iniciando diagnóstico...");
+    StaticJsonDocument<384> doc;
+    doc["ok"] = false;
+
+    modemPowerOn();
+
+    if (!modem.init()) {
+      modemRestart();
+      delay(2000);
+      if (!modem.init()) {
+        doc["msg"] = "El modem SIM800 no responde";
+        modemPowerOff();
+        String response;
+        serializeJson(doc, response);
+        request->send(200, "application/json", response);
+        return;
+      }
+    }
+
+    doc["modemInfo"] = modem.getModemInfo();
+
+    int16_t csq = modem.getSignalQuality();
+    doc["signal"] = csq;
+    doc["simReady"] = modem.getSimStatus() == SIM_READY;
+
+    bool netOk = modem.waitForNetwork(15000L);
+    doc["networkRegistered"] = netOk;
+
+    if (!netOk) {
+      doc["msg"] = "Sin registro en la red celular (revisar SIM/cobertura/antena)";
+      modemPowerOff();
+      String response;
+      serializeJson(doc, response);
+      request->send(200, "application/json", response);
+      return;
+    }
+
+    doc["operator"] = modem.getOperator();
+
+    bool gprsOk = modem.gprsConnect(apn);
+    doc["gprsConnected"] = gprsOk;
+
+    if (gprsOk) {
+      doc["ip"] = modem.localIP().toString();
+      doc["ok"] = true;
+      doc["msg"] = "Conexión a internet OK";
+      modem.gprsDisconnect();
+    } else {
+      doc["msg"] = "Registrado en red, pero falló GPRS (revisar APN: " + String(apn) + ")";
+    }
+
+    modemPowerOff();
+
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+    Serial.println("[LTE TEST] Fin diagnóstico");
+  });
+
+  server.on("/get", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("[HTTP] GET requested");
+    String msg = "OK";
+
+    if (request->hasParam(PARAM_CONN_TYPE)) {
+      String val = request->getParam(PARAM_CONN_TYPE)->value();
+      writeFile(SPIFFS, "/connType.txt", val.c_str());
+      Serial.println("[SAVE] connType: " + val);
+    }
+    else if (request->hasParam(PARAM_SSID)) {
+      String val = request->getParam(PARAM_SSID)->value();
+      writeFile(SPIFFS, "/ssidString.txt", val.c_str());
+      Serial.println("[SAVE] SSID: " + val);
+    }
+    else if (request->hasParam(PARAM_PASS)) {
+      String val = request->getParam(PARAM_PASS)->value();
+      writeFile(SPIFFS, "/passString.txt", val.c_str());
+      Serial.println("[SAVE] Password saved");
+    }
+    else if (request->hasParam(PARAM_SERVER)) {
+      String val = request->getParam(PARAM_SERVER)->value();
+      writeFile(SPIFFS, "/server.txt", val.c_str());
+      Serial.println("[SAVE] Server: " + val);
+    }
+    else if (request->hasParam(PARAM_PORT)) {
+      String val = request->getParam(PARAM_PORT)->value();
+      writeFile(SPIFFS, "/port.txt", val.c_str());
+      Serial.println("[SAVE] Port: " + val);
+    }
+    else if (request->hasParam("topicPub")) {
+      String val = request->getParam("topicPub")->value();
+      writeFile(SPIFFS, "/topicPub.txt", val.c_str());
+      Serial.println("[SAVE] Topic Publish: " + val);
+    }
+    else if (request->hasParam("topicSub")) {
+      String val = request->getParam("topicSub")->value();
+      writeFile(SPIFFS, "/topicSub.txt", val.c_str());
+      Serial.println("[SAVE] Topic Subscribe: " + val);
+    }
+    else if (request->hasParam("dirSensor")) {
+      String val = request->getParam("dirSensor")->value();
+      writeFile(SPIFFS, "/dirSensor.txt", val.c_str());
+      dirSensorType = val;
+      Serial.println("[SAVE] dirSensor: " + val);
+    }
+    else if (request->hasParam("period")) {
+      String period = request->getParam("period")->value();
+      writeFile(SPIFFS, "/timesleep.txt", period.c_str());
+      TIME_TO_SLEEP = period.toInt();
+      Serial.println("[SAVE] Period: " + period + " seg");
+    }
+    else if (request->hasParam("resetRain")) {
+      writeFile(SPIFFS, "/ssidRainCounter.txt", "0");
+      rainPulseCountISR = 0;
+      Serial.println("[SAVE] Contador de lluvia reiniciado");
+    }
+    else if (request->hasParam(PARAM_RESET)) {
+      request->send(200, "text/plain", "Reiniciando...");
+      delay(500);
+      ESP.restart();
+      return;
+    }
+    else {
+      writeFile(SPIFFS, "/A_TH.txt", request->hasParam("A_TH") ? "1" : "0");
+      writeFile(SPIFFS, "/A_PR.txt", request->hasParam("A_PR") ? "1" : "0");
+      writeFile(SPIFFS, "/A_WS.txt", request->hasParam("A_WS") ? "1" : "0");
+      Serial.println("[SAVE] Configuración de sensores guardada");
+    }
+
+    request->redirect("/");
+  });
+
+  server.onNotFound(notFound);
+}
+
+/* ====================== SETTING MODE ======================== */
+void setting() {
+  Serial.println("\n[SETTING MODE] Iniciando...");
+
+  // Detener I2C
+  Wire.end();
+
+  // Desconectar WiFi completamente
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(500);
+
+  // Configurar modo AP
+  Serial.println("[SETTING] Configurando Access Point...");
+  WiFi.mode(WIFI_AP);
+  delay(500);
+
+  // Configurar IP estática
+  IPAddress local_IP(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.softAPConfig(local_IP, gateway, subnet);
+  delay(100);
+
+  // Crear AP con reintentos
+  int retries = 0;
+  while (!WiFi.softAP(ssid, password) && retries < 5) {
+    Serial.printf("[WARN] Intento %d de crear AP...\n", retries + 1);
+    delay(1000);
+    retries++;
+  }
+
+  if (retries >= 5) {
+    Serial.println("[ERROR] No se pudo crear AP");
+    delay(2000);
+    ESP.restart();
+    return;
+  }
+
+  // Esperar estabilización del AP
+  delay(2000);
+
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("[OK] AP activo en: ");
+  Serial.println(IP);
+
+  // Configurar rutas HTTP (función separada)
+  Serial.println("[SETTING] Configurando rutas HTTP...");
+  setupServerRoutes();
+
+  Serial.println("[SETTING] Rutas configuradas. Listo para iniciar servidor...");
+  serverReady = true;
+}
+
+/* ====================== BATTERY VOLTAGE ======================== */
+String vBat() {
+  int rawValue = analogRead(pinBattery);
+  // Divisor: R_top=100k, R_bottom=100k → V_bat_teórico = V_adc × (100+100)/100
+  float v_adc = rawValue * (3.3f / 4095.0f);
+
+  // El ADC del ESP32 (atenuación 11dB) no es lineal en este rango: la
+  // fórmula teórica (x2) subestima la tensión real de forma consistente.
+  // Calibración de 2 puntos contra multímetro:
+  //   3.70 V real → v_adc 1.67 V (teórico daba 3.34 V)
+  //   4.20 V real → v_adc 1.93 V (teórico daba 3.86 V)
+  const float BAT_CAL_SLOPE  = 1.9231f;
+  const float BAT_CAL_OFFSET = 0.4885f;
+  float voltage = v_adc * BAT_CAL_SLOPE + BAT_CAL_OFFSET;
+
+  return String(voltage, 2);
+}
+
+/* ========================= RAIN COUNTER ========================= */
+uint64_t getRtcTimeSeconds() {
+  // El RTC clock corre a ~150kHz (RTC_SLOW_CLK)
+  // rtc_time_get() retorna ticks del RTC
+  uint64_t rtc_ticks = rtc_time_get();
+  uint32_t rtc_freq = rtc_clk_slow_freq_get_hz();
+  if (rtc_freq == 0) rtc_freq = 150000;  // Valor por defecto
+  return rtc_ticks / rtc_freq;
+}
+
+void runRainCounter() {
+  Serial.println("\n[RAIN] ===== PULSO DE LLUVIA =====");
+
+  // El wakeup EXT1 (ESP_EXT1_WAKEUP_ALL_LOW) solo dispara si el pin ya
+  // estaba en LOW (campo presente), así que el pulso es real por
+  // definición: se cuenta directo, sin volver a confirmar el nivel por
+  // ADC (esa verificación venía descartando vaciados reales por
+  // problemas de lectura del pad justo tras el wake). Único filtro que
+  // queda: no contar dos veces el mismo vaciado si el pin sigue
+  // rebotando y se re-arma el wakeup muy rápido.
+  rtc_gpio_deinit((gpio_num_t)RAINCOUNT);
+  pinMode(RAINCOUNT, INPUT);
+
+  uint64_t nowTicks = rtc_time_get();
+  uint32_t rtcFreq = rtc_clk_slow_freq_get_hz();
+  if (rtcFreq == 0) rtcFreq = 150000;
+  uint64_t minIntervalTicks = (uint64_t)rtcFreq * RAIN_PULSE_MIN_INTERVAL_MS / 1000;
+  bool intervalOk = (lastRainPulseRtcTicks == 0) ||
+                     ((nowTicks - lastRainPulseRtcTicks) > minIntervalTicks);
+
+  if (intervalOk) {
+    int rain = readFile(SPIFFS, "/ssidRainCounter.txt").toInt();
+    rain++;
+    writeFile(SPIFFS, "/ssidRainCounter.txt", String(rain).c_str());
+    lastRainPulseRtcTicks = nowTicks;
+    Serial.printf("[RAIN] Contador: %d vaciadas\n", rain);
+  } else {
+    Serial.println("[RAIN] Descartado (muy seguido, <300 ms), no se cuenta");
+  }
+
+  // Esperar a que el campo deje de estar presente (máx. 100 ms) antes de
+  // volver a dormir: si se rearma el EXT1 (nivel LOW = campo presente)
+  // mientras el pin sigue ahí, el wakeup por nivel dispara de inmediato
+  // otra vez. Se usa el mismo criterio por ADC que la detección — más
+  // confiable que digitalRead() con un nivel de reposo (~2.3V) tan cerca
+  // del umbral digital — y un cap más corto (100 ms en vez de 200 ms) ya
+  // que el wake solo tiene que incrementar un contador.
+  unsigned long start = millis();
+  while (analogReadMilliVolts(RAINCOUNT) < RAIN_ADC_IDLE_MV && (millis() - start) < 100) {
+    delayMicroseconds(500);
+  }
+
+  // Calcular tiempo restante
+  TIME_TO_SLEEP = readFile(SPIFFS, "/timesleep.txt").toInt();
+  if (TIME_TO_SLEEP < 60) TIME_TO_SLEEP = 300;
+
+  uint64_t now_rtc = getRtcTimeSeconds();
+
+  // Si no hay un ciclo en curso (primer wake por lluvia desde el último
+  // reporte por TIMER, o el primero desde el flasheo), este mismo
+  // despertar arranca el seguimiento del período: si no se hiciera esto,
+  // cycle_start_rtc/cycle_active solo los fija deepSleepSystem() (ciclo
+  // TIMER), y una cadena de wakeups por lluvia sin que medie un ciclo
+  // TIMER de por medio nunca tendría contra qué medir el tiempo
+  // transcurrido — remaining quedaba siempre en TIME_TO_SLEEP completo,
+  // sin restar nada, en vez de ir descontando entre wakeups.
+  if (!cycle_active || cycle_start_rtc == 0) {
+    cycle_start_rtc = bootRtcSeconds;
+    cycle_active = true;
+  }
+
+  uint64_t elapsed = now_rtc - cycle_start_rtc;
+  int remaining;
+
+  if (elapsed >= TIME_TO_SLEEP) {
+    // El ciclo ya venció mientras dormíamos: si solo reprogramamos otro
+    // período completo aquí, un GPIO39 ruidoso (sin pull-up, ver notas
+    // arriba) que siga generando wakeups EXT1 más seguido que
+    // TIME_TO_SLEEP puede postergar la lectura/envío real de sensores
+    // indefinidamente — el dispositivo "nunca sale" del ciclo dormir/
+    // despertar por lluvia y no llega a reportar. En vez de eso, se
+    // ejecuta el ciclo de operación pendiente ahora mismo.
+    Serial.println("[RAIN] Período vencido durante el wake por lluvia: ejecutando ciclo de operación pendiente");
+    cycle_active = false;
+    init_running();  // No retorna, entra en deep sleep
+    return;
+  }
+
+  remaining = TIME_TO_SLEEP - elapsed;
+  if (remaining < 10) remaining = 10;
+
+  Serial.printf("[RAIN] Restante: %d seg (%d min)\n", remaining, remaining / 60);
+
+  // ===== APAGAR TODO (MOSFET canal P, HIGH=OFF) =====
+  gpio_hold_dis((gpio_num_t)MODEM_PWR_PIN);
+  pinMode(MODEM_PWR_PIN, OUTPUT);
+  digitalWrite(MODEM_PWR_PIN, HIGH);
+  gpio_hold_en((gpio_num_t)MODEM_PWR_PIN);
+
+  // RX2/TX2 a LOW: evita retroalimentar el SIM800 por los pines UART
+  // mientras está sin alimentación (ver modemLinesOff()).
+  modemLinesOff();
+
+  gpio_hold_dis((gpio_num_t)SENS_PWR_PIN);
+  pinMode(SENS_PWR_PIN, OUTPUT);
+  digitalWrite(SENS_PWR_PIN, HIGH);
+  gpio_hold_en((gpio_num_t)SENS_PWR_PIN);
+
+  // Habilitar hold global
+  gpio_deep_sleep_hold_en();
+
+  // Wake ups
+  esp_sleep_enable_timer_wakeup((uint64_t)remaining * uS_TO_S_FACTOR);
+  if (A_PR) {
+    esp_sleep_enable_ext1_wakeup(RAINCOUNT_MASK, ESP_EXT1_WAKEUP_ALL_LOW);
+  }
+
+  Serial.println("[SLEEP] Volviendo a deep sleep...\n");
+  Serial.flush();
+
+  esp_deep_sleep_start();
+}
+
+/* ====================== READ DHT22 ======================== */
+void readDHT22(float &temperature, float &humidity, bool &success) {
+  success = false;
+  temperature = -999;
+  humidity = -999;
+
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+
+  if (!isnan(t) && !isnan(h)) {
+    temperature = t;
+    humidity    = h;
+    success     = true;
+  } else {
+    Serial.println("[DHT22] Error de lectura");
+  }
+}
+
+/* ====================== WIND FUNCTIONS ======================== */
+// Contador de pulsos por interrupción, usado en modo config para calcular
+// la velocidad de forma continua (no bloqueante) en vez del muestreo de
+// polling de 3 s de WindVelocity().
+volatile unsigned long windPulseCountISR = 0;
+volatile unsigned long lastWindPulseMicrosISR = 0;
+bool windISRAttached = false;
+
+void IRAM_ATTR windPulseISR() {
+  // Antirrebote: ver comentario de WIND_PULSE_DEBOUNCE_US arriba.
+  unsigned long now = micros();
+  if (now - lastWindPulseMicrosISR > WIND_PULSE_DEBOUNCE_US) {
+    windPulseCountISR++;
+    lastWindPulseMicrosISR = now;
+  }
+}
+
+/* ====================== RAIN LIVE COUNTER (MODO CONFIG) ================ */
+// runRainCounter() solo cuenta pulsos al despertar por EXT1 (deep sleep);
+// en modo config el equipo no duerme, así que sin esta interrupción la
+// precipitación nunca se actualizaba en la UI. Cuenta pulsos igual que el
+// pluviómetro real: mismos dos filtros que runRainCounter() (ver ahí para
+// el detalle) — confirmar el nivel LOW un par de ms y exigir 300 ms
+// mínimo entre pulsos válidos.
+// NOTA HW: GPIO39 es input-only y el ESP32 NO tiene pull-up/down interno
+// disponible en ese pin en ningún modo (limitación de silicio, no de
+// firmware, a diferencia de GPIO13 del viento que sí lo soporta). Sin una
+// resistencia de pull externa en la placa, el pin queda flotando cuando
+// el contacto del balancín está abierto; estos filtros por software
+// reducen el ruido pero no lo eliminan del todo si el ruido persiste con
+// separación >300 ms — para una solución completa hace falta esa
+// resistencia externa (p.ej. 10k a 3.3V) en la placa.
+volatile unsigned long rainPulseCountISR = 0;
+volatile unsigned long lastRainPulseMillisISR = 0;
+bool rainISRAttached = false;
+
+void IRAM_ATTR rainPulseISR() {
+  unsigned long now = millis();
+  if (now - lastRainPulseMillisISR <= 300) return;
+
+  // Confirmar el nivel LOW en una ventana corta antes de contar: un
+  // glitch de ruido dura microsegundos, mucho menos que el cierre
+  // mecánico real del balancín (igual que en runRainCounter()).
+  for (int i = 0; i < 3; i++) {
+    if (digitalRead(RAINCOUNT) == HIGH) return;
+    delayMicroseconds(300);
+  }
+
+  rainPulseCountISR++;
+  lastRainPulseMillisISR = now;
+}
+
+float WindDirection() {
+  if (dirSensorType == "AS5600") {
+    return as5600.rawAngle() * AS5600_RAW_TO_DEGREES;
+  }
+  return encoder.angleRead();
+}
+
+float WindVelocity() {
+  // Sensor Hall: sin campo = 2.5V (HIGH), con campo = 0V (LOW). El
+  // sensor es push-pull, así que el pull-up interno (~45k) no altera su
+  // nivel activo (baja impedancia), pero define un HIGH sólido cuando el
+  // sensor está desconectado/sin alimentar; sin él, el pin flota y el
+  // ruido se contaba como pulsos de viento reales.
+  // Se cuentan flancos descendentes (HIGH→LOW) = cada imán que pasa,
+  // con el mismo antirrebote por tiempo que windPulseISR (ver
+  // WIND_PULSE_DEBOUNCE_US): con las copas detenidas y un imán justo
+  // sobre el sensor, el parpadeo eléctrico en el umbral se contaba como
+  // rotación real.
+  pinMode(pinWindVelocity, INPUT_PULLUP);
+
+  int counter = 0;
+  boolean lastState = digitalRead(pinWindVelocity);
+  boolean curState;
+  unsigned long lastPulseMicros = micros();
+
+  // 3 s de ventana de medición (600 iter × 5 ms = 3000 ms)
+  for (int i = 0; i < 600; i++) {
+    curState = digitalRead(pinWindVelocity);
+    if (lastState == HIGH && curState == LOW) {  // flanco descendente
+      unsigned long now = micros();
+      if (now - lastPulseMicros > WIND_PULSE_DEBOUNCE_US) {
+        counter++;
+        lastPulseMicros = now;
+      }
+    }
+    lastState = curState;
+    delay(5);
+  }
+
+  float speed = counter * (WIND_SPEED_PER_PULSE / 3.0);
+  if (speed > MAX_WIND_SPEED_MS) {
+    Serial.printf("[WIND] Lectura descartada por implausible: %.1f m/s (ruido del sensor Hall)\n", speed);
+    speed = 0;
+  }
+  return speed;
+}
+
+/* ====================== SIM800 FUNCTIONS ======================== */
+// Recuerda si el modem quedó realmente encendido este ciclo, para no
+// intentar un apagado AT (bloqueante hasta 10 s) cuando nunca se energizó
+// (p.ej. al entrar a modo config en conexión WiFi).
+bool modemPoweredOn = false;
+
+// Fuerza RX2/TX2 a salida LOW (no solo alta impedancia) y bloquea ese
+// estado con hold: dejarlos flotando (INPUT) o en HIGH (idle de UART)
+// retroalimenta el SIM800 a través de los diodos de protección ESD de
+// sus pines, energizándolo parcialmente (~2.7V medidos) incluso con el
+// MOSFET de alimentación cortado. Debe llamarse siempre que el modem no
+// esté en uso, incluido antes de cada deep sleep, sin importar el modo
+// de conexión (WiFi nunca enciende el modem, así que sin esto estos
+// pines quedarían en su estado flotante por defecto durante todo el sleep).
+void modemLinesOff() {
+  gpio_hold_dis((gpio_num_t)PIN_TX2);
+  gpio_hold_dis((gpio_num_t)PIN_RX2);
+  pinMode(PIN_TX2, OUTPUT);
+  pinMode(PIN_RX2, OUTPUT);
+  digitalWrite(PIN_TX2, LOW);
+  digitalWrite(PIN_RX2, LOW);
+  gpio_hold_en((gpio_num_t)PIN_TX2);
+  gpio_hold_en((gpio_num_t)PIN_RX2);
+}
+
+void modemPowerOn() {
+  Serial.println("[MODEM] Encendiendo SIM800...");
+
+  // Liberar el hold LOW de RX2/TX2 antes de que begin() los reconfigure
+  // como pines UART, si no, el periférico no puede tomar control de ellos.
+  gpio_hold_dis((gpio_num_t)PIN_TX2);
+  gpio_hold_dis((gpio_num_t)PIN_RX2);
+
+  gpio_hold_dis((gpio_num_t)MODEM_PWR_PIN);
+  pinMode(MODEM_PWR_PIN, OUTPUT);
+  digitalWrite(MODEM_PWR_PIN, LOW);  // MOSFET canal P: LOW = ON
+  delay(3000);  // esperar arranque del SIM800
+
+  SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX2, PIN_TX2);
+  modemPoweredOn = true;
+
+  Serial.println("[MODEM] SIM800 encendido");
+}
+
+void modemPowerOff() {
+  Serial.println("[MODEM] Apagando SIM800...");
+
+  if (modemPoweredOn) {
+    // Apagado ordenado (AT+CPOWD=1) antes de cortar la alimentación: si
+    // se corta el MOSFET de golpe mientras el modem sigue registrado en
+    // la red, puede quedar en un estado intermedio que sigue consumiendo
+    // corriente (LED de red parpadeando) durante todo el deep sleep del
+    // ESP32.
+    modem.poweroff();
+    delay(300);
+  }
+
+  SerialAT.end();
+  modemLinesOff();
+
+  gpio_hold_dis((gpio_num_t)MODEM_PWR_PIN);
+  pinMode(MODEM_PWR_PIN, OUTPUT);
+  digitalWrite(MODEM_PWR_PIN, HIGH);  // MOSFET canal P: HIGH = OFF
+  gpio_hold_en((gpio_num_t)MODEM_PWR_PIN);
+
+  modemPoweredOn = false;
+
+  Serial.println("[MODEM] SIM800 apagado");
+}
+
+void modemRestart() {
+  modemPowerOff();
+  delay(1000);
+  modemPowerOn();
+}
+
+/* ====================== MQTT CALLBACK ======================== */
+// Permite a waitForConfig() salir en cuanto llega la config, en vez de
+// esperar siempre los 5 s completos con el modem/WiFi encendidos.
+bool configReceivedFlag = false;
+
+void callback(char *topic, byte *payload, unsigned int length) {
+  Serial.printf("[CONFIG] Topic recibido: %s\n", topic);
+
+  // Extract MAC from end of topic: jhpAI/FAUNA/settings/AA:BB:CC:DD:EE:FF
+  String topicStr = String(topic);
+  String macInTopic = topicStr.substring(topicStr.lastIndexOf('/') + 1);
+  String deviceMac = macA();
+  macInTopic.toUpperCase();
+  deviceMac.toUpperCase();
+
+  if (macInTopic != deviceMac) {
+    Serial.printf("[CONFIG] MAC no coincide: topic=%s device=%s\n",
+                  macInTopic.c_str(), deviceMac.c_str());
+    return;
+  }
+
+  String msg_in = "";
+  for (unsigned int i = 0; i < length; i++) msg_in += (char)payload[i];
+  Serial.println("[CONFIG] Mensaje: " + msg_in);
+
+  StaticJsonDocument<256> docIn;
+  DeserializationError error = deserializeJson(docIn, msg_in);
+  if (error) {
+    Serial.printf("[CONFIG] JSON error: %s\n", error.c_str());
+    return;
+  }
+
+  if (docIn.containsKey("status"))    status        = docIn["status"].as<bool>();
+  if (docIn.containsKey("timesleep")) TIME_TO_SLEEP = (uint64_t)docIn["timesleep"].as<int>() * 60; // min → seg
+  if (docIn.containsKey("A_TH"))      A_TH          = docIn["A_TH"].as<bool>();
+  if (docIn.containsKey("A_WS"))      A_WS          = docIn["A_WS"].as<bool>();
+  if (docIn.containsKey("A_PR"))      A_PR          = docIn["A_PR"].as<bool>();
+  if (docIn.containsKey("dirSensor")) dirSensorType = docIn["dirSensor"].as<String>() == "AS5600" ? "AS5600" : "MT6701";
+
+  saveSetting(status ? "1" : "0",         "/status.txt");
+  saveSetting(String((int)TIME_TO_SLEEP), "/timesleep.txt");
+  saveSetting(A_TH ? "1" : "0",          "/A_TH.txt");
+  saveSetting(A_WS ? "1" : "0",          "/A_WS.txt");
+  saveSetting(A_PR ? "1" : "0",          "/A_PR.txt");
+  saveSetting(dirSensorType,             "/dirSensor.txt");
+
+  Serial.printf("[CONFIG] OK status=%d sleep=%llu seg (%llu min) TH=%d WS=%d PR=%d dirSensor=%s\n",
+                status, TIME_TO_SLEEP, TIME_TO_SLEEP / 60, A_TH, A_WS, A_PR, dirSensorType.c_str());
+
+  configReceivedFlag = true;
+}
+
+/* ====================== MQTT RECONNECT ======================== */
+void wifiReconnect() {
+  int count = 0;
+  while (!wificlient.connected()) {
+    String client_id = "esp32-client-" + macA();
+
+    if (wificlient.connect(client_id.c_str())) {
+      String topiSub = String(topicSubscribe) + "/" + macA();
+      wificlient.subscribe(topiSub.c_str());
+      wificlient.setCallback(callback);
+      Serial.println("[MQTT] Conectado via WiFi");
+    } else {
+      Serial.print("[MQTT] Error: ");
+      Serial.println(wificlient.state());
+      if (count >= 5) {
+        ESP.restart();
+      }
+      delay(5000);
+    }
+    count++;
+  }
+}
+
+void simReconnect() {
+  int count = 0;
+  while (!simclient.connected()) {
+    String client_id = "esp32-client-" + macA();
+
+    if (simclient.connect(client_id.c_str())) {
+      String topiSub = String(topicSubscribe) + "/" + macA();
+      simclient.subscribe(topiSub.c_str());
+      simclient.setCallback(callback);
+      Serial.println("[MQTT] Conectado via LTE");
+    } else {
+      Serial.print("[MQTT] Error: ");
+      Serial.println(simclient.state());
+      if (count >= 3) {
+        ESP.restart();
+      }
+      delay(5000);
+    }
+    count++;
+  }
+}
+
+bool checkMQTT() {
+  if (connectionType == "WIFI") {
+    return wificlient.connected();
+  } else if (connectionType == "LTE") {
+    return simclient.connected();
+  }
+  return false;
+}
+
+/* ========================= WAKE UP REASON ========================= */
+
+void wakeup_reason() {
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  switch (wakeup_reason) {
+    case ESP_SLEEP_WAKEUP_EXT0:
+      Serial.println("[WAKEUP] External 0");
+      break;
+
+    case ESP_SLEEP_WAKEUP_EXT1:
+      Serial.println("[WAKEUP] Rain counter (EXT1)");
+      // Actualizar tiempo transcurrido: tiempo dormido = tiempo configurado - restante
+      // Como despertó por lluvia, el tiempo dormido es aproximadamente lo que faltaba
+      // Esto se maneja dentro de runRainCounter()
+      runRainCounter();  // No retorna, entra en deep sleep
+      break;
+
+    case ESP_SLEEP_WAKEUP_TIMER:
+      Serial.println("[WAKEUP] Timer - Ciclo completado");
+      init_running();
+      break;
+
+    case ESP_SLEEP_WAKEUP_TOUCHPAD:
+      Serial.println("[WAKEUP] Touchpad");
+      break;
+
+    case ESP_SLEEP_WAKEUP_ULP:
+      Serial.println("[WAKEUP] ULP");
+      break;
+
+    default:
+      Serial.printf("[WAKEUP] Inicio normal (razón: %d)\n", wakeup_reason);
+      init_running();
+      break;
+  }
+}
+
+/* ====================== LEER SENSORES ======================== */
+String readSensors() {
+  Serial.println("\n[SENSORS] Iniciando lectura de sensores...");
+
+  DynamicJsonDocument docOut(256);
+  docOut["type"] = "weatherStationData";
+  docOut["mac"] = macA();
+  docOut["conn"] = connectionType;
+
+  // Encender sensores: MOSFET canal P gate LOW = ON
+  pinMode(SENS_PWR_PIN, OUTPUT);
+  digitalWrite(SENS_PWR_PIN, LOW);
+  delay(2500);  // AM2301 necesita ≥2.5 s de arranque frío tras encender v_sensor
+
+  // Iniciar I2C una sola vez — solo lo usa el MT6701
+  if (A_WS) {
+    Wire.begin(I2C_SDA, I2C_SCL);
+    delay(50);
+  }
+
+  // ===== TEMPERATURA Y HUMEDAD (DHT22) =====
+  if (A_TH) {
+    Serial.println("[SENSOR] Leyendo DHT22...");
+    initDHT22();
+
+    float temp, hum;
+    bool ok;
+    int retries = 0;
+
+    do {
+      readDHT22(temp, hum, ok);
+      if (!ok) {
+        retries++;
+        delay(2000);  // el DHT22 necesita ~2 s entre lecturas
+      }
+    } while (!ok && retries < 5);
+
+    if (ok) {
+      docOut["T"] = String(temp, 2);
+      docOut["H"] = String(hum, 2);
+      Serial.printf("[SENSOR] Temp: %.2f°C, Hum: %.2f%%\n", temp, hum);
+    } else {
+      docOut["T"] = "error";
+      docOut["H"] = "error";
+      Serial.println("[SENSOR] Error leyendo DHT22");
+    }
+  }
+
+  // ===== VELOCIDAD Y DIRECCIÓN DEL VIENTO =====
+  if (A_WS) {
+    Serial.println("[SENSOR] Leyendo viento...");
+
+    initMT6701();
+    float wv = WindVelocity();
+    float wd = WindDirection();
+
+    docOut["WV"] = String(wv, 2);
+    docOut["WD"] = String(wd, 1);
+    Serial.printf("[SENSOR] Vel: %.2f m/s, Dir: %.1f°\n", wv, wd);
+  }
+
+  // ===== PRECIPITACIÓN =====
+  if (A_PR) {
+    Serial.println("[SENSOR] Leyendo precipitación...");
+
+    // Se reporta como número entero de vaciadas del balancín (no en mm):
+    // dato persistente en SPIFFS, incrementado en runRainCounter() cada
+    // vez que el deep sleep se interrumpe por un pulso de lluvia (EXT1).
+    String rainStr = readFile(SPIFFS, "/ssidRainCounter.txt");
+    int rain = rainStr != "" ? rainStr.toInt() : 0;
+
+    docOut["RA"] = rain;
+    Serial.printf("[SENSOR] Lluvia: %d vaciadas\n", rain);
+    // No se resetea aquí: es un contador acumulado persistente, solo se
+    // reinicia manualmente desde la vista de configuración (botón
+    // "Reiniciar Contador de Lluvia" -> /get?resetRain=1).
+  }
+
+  // Apagar sensores: MOSFET canal P gate HIGH = OFF
+  digitalWrite(SENS_PWR_PIN, HIGH);
+
+  // ===== BATERÍA =====
+  String bat = vBat();
+  docOut["vB"] = bat;
+  Serial.printf("[SENSOR] Batería: %s V\n", bat.c_str());
+
+  // Serializar JSON
+  String jsonString;
+  serializeJson(docOut, jsonString);
+  Serial.println("[DATA] " + jsonString);
+
+  return jsonString;
+}
+
+/* ====================== WAIT FOR CONFIG ======================== */
+// Solo espera 5 s procesando mensajes MQTT.
+// La suscripción debe hacerse ANTES de publicar datos (en sendData*)
+// para no perder la respuesta rápida del servidor.
+void waitForConfig(PubSubClient &mqttClient) {
+  Serial.println("[CONFIG] Esperando configuración (máx. 5 s)...");
+  configReceivedFlag = false;
+  unsigned long t = millis();
+  // Cortar en cuanto llega la config en vez de esperar siempre los 5 s:
+  // cada segundo de espera de más mantiene el modem LTE (o WiFi) encendido
+  // sin necesidad, ciclo tras ciclo.
+  while (millis() - t < 5000 && !configReceivedFlag) {
+    mqttClient.loop();
+    delay(50);
+  }
+  Serial.println("[CONFIG] Fin espera");
+}
+
+/* ============MODEM ========== ENVIO LTE (SIM800) ======================== */
+bool sendDataLTE(String jsonData) {
+  Serial.println("\n[LTE] Iniciando envío de datos...");
+
+  // Encender modem
+  modemPowerOn();
+
+  // Inicializar modem
+  if (!modem.init()) {
+    modemRestart();
+    delay(2000);
+    if (!modem.init()) {
+      Serial.println("[ERROR] Modem no responde");
+      modemPowerOff();
+      return false;
+    }
+  }
+
+  Serial.println("[LTE] Modem: " + modem.getModemInfo());
+
+  // Esperar red
+  Serial.println("[LTE] Esperando red...");
+  if (!modem.waitForNetwork(60000L)) {
+    Serial.println("[ERROR] Sin cobertura de red");
+    modemPowerOff();
+    return false;
+  }
+
+  Serial.println("[LTE] Red conectada");
+
+  // Conectar GPRS
+  Serial.println("[LTE] Conectando GPRS...");
+  if (!modem.gprsConnect(apn)) {
+    Serial.println("[ERROR] Fallo conexión GPRS");
+    modemPowerOff();
+    return false;
+  }
+
+  Serial.println("[LTE] GPRS conectado");
+
+  // Configurar MQTT
+  String serverIP = readFile(SPIFFS, "/server.txt");
+  String topicPub = readFile(SPIFFS, "/topicPub.txt");
+
+  if (serverIP == "") serverIP = broker;
+  if (topicPub == "") topicPub = "jhpAI/FAUNA/data";
+
+  simclient.setServer(serverIP.c_str(), mqtt_port);
+
+  // Conectar a MQTT
+  int mqttRetries = 0;
+  String clientId = "ws-" + macA();
+
+  while (!simclient.connected() && mqttRetries < 5) {
+    Serial.printf("[MQTT] Conectando a %s... ", serverIP.c_str());
+
+    if (simclient.connect(clientId.c_str())) {
+      Serial.println("OK");
+    } else {
+      Serial.printf("Error: %d\n", simclient.state());
+      mqttRetries++;
+      delay(2000);
+    }
+  }
+
+  if (!simclient.connected()) {
+    Serial.println("[ERROR] No se pudo conectar a MQTT");
+    modem.gprsDisconnect();
+    modemPowerOff();
+    return false;
+  }
+
+  // Suscribir ANTES de publicar: el servidor responde rápido
+  String cfgTopic = readFile(SPIFFS, "/topicSub.txt");
+  if (cfgTopic == "") cfgTopic = String(topicSubscribe);
+  cfgTopic += "/" + macA();
+  simclient.setCallback(callback);
+  simclient.subscribe(cfgTopic.c_str());
+  Serial.printf("[CONFIG] Suscrito a: %s\n", cfgTopic.c_str());
+
+  // Publicar datos
+  bool published = simclient.publish(topicPub.c_str(), jsonData.c_str());
+
+  if (published) {
+    Serial.println("[MQTT] Datos publicados correctamente");
+  } else {
+    Serial.println("[ERROR] Fallo al publicar");
+  }
+
+  simclient.loop();
+  delay(100);
+
+  if (published) waitForConfig(simclient);
+
+  // Desconectar
+  simclient.disconnect();
+  modem.gprsDisconnect();
+  modemPowerOff();
+
+  Serial.println("[LTE] Desconectado");
+
+  return published;
+}
+
+/* ====================== ENVIO WIFI======================== */
+bool sendDataWiFi(String jsonData) {
+  Serial.println("\n[WIFI] Iniciando envío de datos...");
+
+  RUNssid = readFile(SPIFFS, "/ssidString.txt");
+  RUNpass = readFile(SPIFFS, "/passString.txt");
+
+  if (RUNssid == "") {
+    Serial.println("[ERROR] SSID no configurado");
+    return false;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(RUNssid, RUNpass);
+
+  int wifiRetries = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiRetries < 20) {
+    delay(500);
+    Serial.print(".");
+    wifiRetries++;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\n[ERROR] No se pudo conectar a WiFi");
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    return false;
+  }
+
+  Serial.println("\n[WIFI] Conectado: " + WiFi.localIP().toString());
+
+  // Configurar MQTT
+  String serverIP = readFile(SPIFFS, "/server.txt");
+  String topicPub = readFile(SPIFFS, "/topicPub.txt");
+
+  if (serverIP == "") serverIP = broker;
+  if (topicPub == "") topicPub = "jhpAI/FAUNA/data";
+
+  wificlient.setServer(serverIP.c_str(), mqtt_port);
+
+  // Conectar a MQTT
+  int mqttRetries = 0;
+  String clientId = "ws-" + macA();
+
+  while (!wificlient.connected() && mqttRetries < 5) {
+    Serial.printf("[MQTT] Conectando a %s... ", serverIP.c_str());
+
+    if (wificlient.connect(clientId.c_str())) {
+      Serial.println("OK");
+    } else {
+      Serial.printf("Error: %d\n", wificlient.state());
+      mqttRetries++;
+      delay(1000);
+    }
+  }
+
+  if (!wificlient.connected()) {
+    Serial.println("[ERROR] No se pudo conectar a MQTT");
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    return false;
+  }
+
+  // Suscribir ANTES de publicar: el servidor responde rápido
+  String cfgTopic = readFile(SPIFFS, "/topicSub.txt");
+  if (cfgTopic == "") cfgTopic = String(topicSubscribe);
+  cfgTopic += "/" + macA();
+  wificlient.setCallback(callback);
+  wificlient.subscribe(cfgTopic.c_str());
+  Serial.printf("[CONFIG] Suscrito a: %s\n", cfgTopic.c_str());
+
+  // Publicar datos
+  bool published = wificlient.publish(topicPub.c_str(), jsonData.c_str());
+
+  if (published) {
+    Serial.println("[MQTT] Datos publicados correctamente");
+  } else {
+    Serial.println("[ERROR] Fallo al publicar");
+  }
+
+  wificlient.loop();
+  delay(100);
+
+  if (published) waitForConfig(wificlient);
+
+  // Desconectar
+  wificlient.disconnect();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  Serial.println("[WIFI] Desconectado");
+
+  return published;
+}
+
+/* ====================== INIT RUNNING ======================== */
+// pinConfigAP (GPIO36) es un pin solo-entrada SIN resistencia pull interna en el ESP32
+// (igual que 34/35/39) — requiere resistencia pull-up EXTERNA a 3.3V. El botón de
+// configuración debe conectar el pin a GND al presionarlo (activo en LOW).
+void init_running() {
+  pinMode(pinConfigAP, INPUT);
+
+  // GPIO36 no tiene pull-up interna; leer múltiples veces para confirmar
+  // que el botón está realmente presionado (pin sostenido en GND) y no flotando.
+  bool configPressed = true;
+  for (int i = 0; i < 10; i++) {
+    if (digitalRead(pinConfigAP)) { configPressed = false; break; }
+    delay(10);
+  }
+
+  if (configPressed) {
+    Serial.println("====> Modo Configuración");
+    modemPowerOff();
+    setting();
+  } else {
+    Serial.println("====> Modo Operación");
+
+    connectionType = readFile(SPIFFS, "/connType.txt");
+
+    if (connectionType == "") {
+      connectionType = "WIFI";
+      writeFile(SPIFFS, "/connType.txt", connectionType.c_str());
+    }
+
+    readConfig();
+
+    String sensorData = readSensors();
+
+    // Respaldo local en la SD, independientemente de si el envío MQTT funciona
+    logToSD(sensorData);
+
+    bool success = false;
+
+    if (connectionType == "WIFI") {
+      Serial.println("[MODE] WiFi");
+      success = sendDataWiFi(sensorData);
+    } else if (connectionType == "LTE") {
+      Serial.println("[MODE] LTE");
+      success = sendDataLTE(sensorData);
+    }
+
+    if (success) {
+      Serial.println("[OK] Datos enviados correctamente");
+    } else {
+      Serial.println("[ERROR] Fallo al enviar datos");
+    }
+
+    // Entrar en deep sleep
+    deepSleepSystem();
+
+    delay(500);
+  }
+}
+
+/* ================== READ CONFIG ==================*/
+void readConfig() {
+  Serial.println("\n========== LEYENDO CONFIGURACIONES ==========\n");
+
+  String ath = readFile(SPIFFS, "/A_TH.txt");
+  String aws = readFile(SPIFFS, "/A_WS.txt");
+  String apr = readFile(SPIFFS, "/A_PR.txt");
+  String dirSensor = readFile(SPIFFS, "/dirSensor.txt");
+
+  A_TH = (ath == "1");
+  A_WS = (aws == "1");
+  A_PR = (apr == "1");
+  dirSensorType = (dirSensor == "AS5600") ? "AS5600" : "MT6701";
+
+  Serial.println("---- VALORES CARGADOS ----");
+  Serial.printf("A_TH = %s\n", A_TH ? "true" : "false");
+  Serial.printf("A_WS = %s\n", A_WS ? "true" : "false");
+  Serial.printf("A_PR = %s\n", A_PR ? "true" : "false");
+  Serial.printf("dirSensorType = %s\n\n", dirSensorType.c_str());
+}
+
+/* ================== INIT SENSORS ==================*/
+// Wire.begin() se llama UNA SOLA VEZ en readSensors/updateSensCache
+// para que el MT6701 use el bus I2C sin conflictos con otras llamadas.
+void initDHT22() {
+  dht.begin();
+  delay(2000);
+  // La primera lectura tras power-on devuelve siempre valores de arranque (1.0/1.0);
+  // se descarta para que las siguientes lecturas sean válidas.
+  dht.readTemperature();
+  dht.readHumidity();
+  delay(2000);
+}
+
+void initMT6701() {
+  // Wire ya inicializado externamente; solo configurar el encoder elegido (MT6701/AS5600)
+  delay(50);
+  if (dirSensorType == "AS5600") {
+    as5600.begin();
+  } else {
+    encoder.initializeI2C();
+  }
+  delay(50);
+}
+
+/* ====================== SENSOR CACHE UPDATE ======================== */
+// En modo configuración el sensor rail se deja energizado de forma continua,
+// DHT22/MT6701 se inicializan una sola vez, y el viento se cuenta por
+// interrupción en segundo plano: así updateSensCache() nunca bloquea y puede
+// llamarse en cada vuelta de loop() para reflejar lecturas casi en tiempo real.
+void updateSensCache() {
+  static bool sensorsInitialized = false;
+  static unsigned long lastDHTRead = 0;
+  static unsigned long lastWindCalc = 0;
+  static unsigned long windPulsesAtLastCalc = 0;
+  static unsigned long lastRainCheckTime = 0;
+  static unsigned long rainPulsesAtLastCheck = 0;
+  const unsigned long RAIN_CHECK_WINDOW_MS = 5000;  // ventana para detectar variacion de pulsos
+
+  if (!sensorsInitialized) {
+    Serial.println("[CACHE] Inicializando sensores (una sola vez)...");
+
+    // MOSFET canal P: LOW = ON — se mantiene encendido mientras dure el modo config
+    pinMode(SENS_PWR_PIN, OUTPUT);
+    digitalWrite(SENS_PWR_PIN, LOW);
+    delay(2500);  // AM2301 necesita ≥2.5 s de arranque frío tras encender v_sensor
+
+    if (A_WS) {
+      Wire.begin(I2C_SDA, I2C_SCL);
+      delay(50);
+      initMT6701();
+
+      pinMode(pinWindVelocity, INPUT_PULLUP);
+      attachInterrupt(digitalPinToInterrupt(pinWindVelocity), windPulseISR, FALLING);
+      windISRAttached = true;
+    }
+
+    if (A_TH) {
+      initDHT22();
+      lastDHTRead = millis() - 2000;  // permitir una lectura inmediata
+    }
+
+    if (A_PR) {
+      // Sin interrupción: el nivel "sin campo" (~2.3V) queda demasiado
+      // cerca del umbral digital del ESP32 para fiarse de un FALLING por
+      // hardware. Se sondea el voltaje real por ADC en cada vuelta de
+      // loop() más abajo (ver RAIN_ADC_FIELD_MV / RAIN_ADC_IDLE_MV).
+      pinMode(RAINCOUNT, INPUT);
+    }
+
+    lastWindCalc = millis();
+    lastRainCheckTime = millis();
+    sensorsInitialized = true;
+  }
+
+  // DHT22: el sensor solo admite una lectura válida cada ~2 s
+  if (A_TH) {
+    if (millis() - lastDHTRead >= 2000) {
+      float t, h; bool ok;
+      readDHT22(t, h, ok);
+      if (ok) {
+        sensCache.temp = String(t, 1);
+        sensCache.hum  = String(h, 1);
+      }
+      lastDHTRead = millis();
+    }
+  } else {
+    sensCache.temp = "NA";
+    sensCache.hum  = "NA";
+  }
+
+  if (A_WS) {
+    // Velocidad: pulsos acumulados por ISR desde el último cálculo (ventana de 1 s)
+    unsigned long now = millis();
+    unsigned long elapsed = now - lastWindCalc;
+    if (elapsed >= 1000) {
+      // Lectura de 32 bits, atómica en ESP32: no hace falta deshabilitar
+      // interrupciones (hacerlo aquí interfiere con el stack WiFi/AsyncTCP).
+      unsigned long pulses = windPulseCountISR;
+      unsigned long delta = pulses - windPulsesAtLastCalc;
+      windPulsesAtLastCalc = pulses;
+      lastWindCalc = now;
+
+      float speed = delta * (WIND_SPEED_PER_PULSE / (elapsed / 1000.0));
+      if (speed > MAX_WIND_SPEED_MS) {
+        Serial.printf("[WIND] Lectura descartada por implausible: %.1f m/s (ruido del sensor Hall)\n", speed);
+        speed = 0;
+      }
+      sensCache.wvel = String(speed, 1);
+    }
+    sensCache.wdir = String(WindDirection(), 1);
+  } else {
+    sensCache.wvel = "NA";
+    sensCache.wdir = "NA";
+  }
+
+  if (A_PR) {
+    // Conteo por sondeo de ADC con histéresis (no por interrupción, ver
+    // nota en la inicialización): se muestrea cada ~20 ms y solo se
+    // cuenta un pulso al pasar de "reposo confirmado" a "campo
+    // confirmado", con 500-1500 mV de zona muerta entre ambos y un
+    // mínimo de RAIN_PULSE_MIN_INTERVAL_MS entre pulsos contados.
+    static bool rainIdleState = true;
+    static unsigned long lastRainSampleMs = 0;
+    static unsigned long lastRainPulseMs = 0;
+
+    unsigned long nowR = millis();
+    if (nowR - lastRainSampleMs >= 20) {
+      lastRainSampleMs = nowR;
+      uint32_t mv = analogReadMilliVolts(RAINCOUNT);
+
+      if (mv < RAIN_ADC_FIELD_MV) {
+        if (rainIdleState && (nowR - lastRainPulseMs > RAIN_PULSE_MIN_INTERVAL_MS)) {
+          rainPulseCountISR++;
+          lastRainPulseMs = nowR;
+        }
+        rainIdleState = false;
+      } else if (mv > RAIN_ADC_IDLE_MV) {
+        rainIdleState = true;
+      }
+      // Entre 500-1500 mV: zona muerta, se ignora la muestra (no cambia estado).
+    }
+
+    // Total acumulado del ciclo (pulsos persistidos en SPIFFS + los contados
+    // en vivo desde que arrancó el modo config, aún no volcados a SPIFFS).
+    unsigned long livePulses = rainPulseCountISR;
+
+    // Diagnóstico: confirma en el monitor serie que cada pulso del sensor
+    // Hall (~2.3V sin campo / ~21mV con campo) fue detectado por sondeo ADC.
+    static unsigned long lastLoggedPulses = 0;
+    if (livePulses != lastLoggedPulses) {
+      Serial.printf("[RAIN] Pulso detectado en vivo. Total sesión: %lu (%lu mV)\n",
+                    livePulses, (unsigned long)analogReadMilliVolts(RAINCOUNT));
+      lastLoggedPulses = livePulses;
+    }
+
+    int savedPulses = readFile(SPIFFS, "/ssidRainCounter.txt").toInt();
+    unsigned long totalPulses = savedPulses + livePulses;
+    sensCache.rain = String(totalPulses * RAIN_MM_PER_TIP, 2);
+    sensCache.rainCount = String(totalPulses);
+
+    // Algoritmo de detección de tormenta: si el conteo de pulsos no varía
+    // dentro de la ventana, no hay lluvia; si se incrementa, hay lluvia presente.
+    unsigned long now = millis();
+    if (now - lastRainCheckTime >= RAIN_CHECK_WINDOW_MS) {
+      sensCache.rainStatus = (livePulses > rainPulsesAtLastCheck) ? "Lluvia detectada" : "Sin lluvia";
+      rainPulsesAtLastCheck = livePulses;
+      lastRainCheckTime = now;
+    }
+  } else {
+    sensCache.rain = "NA";
+    sensCache.rainStatus = "NA";
+    sensCache.rainCount = "NA";
+  }
+
+  sensCache.bat = vBat();
+}
+
+/* ================== CREATE DEFAULT CONFIGS ==================*/
+void createDefaultConfigs() {
+  Serial.println("[INIT] Verificando archivos de configuración...");
+
+  struct ConfigFile {
+    const char* path;
+    const char* defaultValue;
+  };
+
+  ConfigFile configs[] = {
+    {"/A_TH.txt", "0"},
+    {"/A_WS.txt", "0"},
+    {"/A_PR.txt", "0"},
+    {"/dirSensor.txt", "MT6701"},
+    {"/connType.txt", "WIFI"},
+    {"/timesleep.txt", "300"},
+    {"/ssidRainCounter.txt", "0"},
+    {"/ssidString.txt", ""},
+    {"/passString.txt", ""},
+    {"/server.txt", ""},
+    {"/port.txt", "8000"},
+    {"/topicPub.txt", "jhpAI/FAUNA/data"},
+    {"/topicSub.txt", "jhpAI/FAUNA/settings"},
+    {"/status.txt", "1"}
+  };
+
+  int numConfigs = sizeof(configs) / sizeof(configs[0]);
+
+  for (int i = 0; i < numConfigs; i++) {
+    if (!SPIFFS.exists(configs[i].path)) {
+      Serial.printf("[INIT] Creando: %s = %s\n", configs[i].path, configs[i].defaultValue);
+      writeFile(SPIFFS, configs[i].path, configs[i].defaultValue);
+    }
+  }
+
+  Serial.println("[INIT] Archivos de configuración verificados\n");
+}
+
+/* ================== MAIN SETUP ==================*/
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // Capturado lo antes posible: referencia para medir cuánto dura este
+  // ciclo despierto (ver deepSleepSystem()).
+  bootRtcSeconds = getRtcTimeSeconds();
+
+  // ===== LIBERAR TODOS LOS GPIO HOLDS =====
+  gpio_deep_sleep_hold_dis();
+  gpio_hold_dis((gpio_num_t)MODEM_PWR_PIN);
+  gpio_hold_dis((gpio_num_t)SENS_PWR_PIN);
+  gpio_hold_dis((gpio_num_t)LED_PIN);
+  gpio_hold_dis((gpio_num_t)PIN_TX2);
+  gpio_hold_dis((gpio_num_t)PIN_RX2);
+
+  // ===== ASEGURAR MODEM Y SENSORES APAGADOS =====
+  // MOSFET canal P: HIGH = OFF. A diferencia del SIM7000 no se requiere
+  // pulso de PWRKEY: toda la alimentación del módulo se corta con el MOSFET.
+  pinMode(MODEM_PWR_PIN, OUTPUT);
+  digitalWrite(MODEM_PWR_PIN, HIGH);
+
+  pinMode(SENS_PWR_PIN, OUTPUT);
+  digitalWrite(SENS_PWR_PIN, HIGH);
+
+  // RX2/TX2 a LOW por defecto hasta que modemPowerOn() los reconfigure
+  // como UART: evita retroalimentar el SIM800 (ver modemLinesOff()).
+  pinMode(PIN_TX2, OUTPUT);
+  pinMode(PIN_RX2, OUTPUT);
+  digitalWrite(PIN_TX2, LOW);
+  digitalWrite(PIN_RX2, LOW);
+
+  // Montar SPIFFS
+  if (!SPIFFS.begin(true)) {
+    Serial.println("Intentando formatear...");
+
+    if (SPIFFS.format()) {
+      Serial.println("[OK] SPIFFS formateado");
+      if (SPIFFS.begin(true)) {
+        Serial.println("[OK] SPIFFS montado después de formatear");
+      } else {
+        Serial.println("[ERROR CRÍTICO] No se pudo montar SPIFFS");
+        return;
+      }
+    } else {
+      Serial.println("[ERROR CRÍTICO] No se pudo formatear SPIFFS");
+      return;
+    }
+  } else {
+    Serial.println("[OK] SPIFFS montado correctamente");
+  }
+
+  // ===== CAMINO RÁPIDO: wake por lluvia (EXT1) =====
+  // Si despertamos por un pulso del pluviómetro, saltarse el montaje de
+  // SD, createDefaultConfigs() y el resto de readConfig(): nada de eso
+  // hace falta solo para incrementar el contador, y el tiempo que suman
+  // (el montaje de SD en particular, con la tarjeta ausente o con fallo,
+  // puede tardar varios cientos de ms en fallar) hacía que para cuando el
+  // código llegaba a leer el pin ya se hubiera reabierto el contacto de
+  // un vaciado breve, descartándolo por error como "ruido".
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) {
+    A_PR = readFile(SPIFFS, "/A_PR.txt") == "1";
+    Serial.println("[WAKEUP] Rain counter (EXT1) - camino rápido");
+    runRainCounter();  // No retorna, entra en deep sleep
+    return;
+  }
+
+  Serial.printf("Total: %d bytes\n", SPIFFS.totalBytes());
+  Serial.printf("Usado: %d bytes\n\n", SPIFFS.usedBytes());
+
+  // Montar SD (VSPI: MISO19/MOSI23/SCK18/CS5)
+  initSD();
+
+  createDefaultConfigs();
+
+  // Leer configuración
+  readConfig();
+
+  if (A_PR) {
+    pinMode(RAINCOUNT, INPUT);
+    esp_sleep_enable_ext1_wakeup(RAINCOUNT_MASK, ESP_EXT1_WAKEUP_ALL_LOW);
+    Serial.println("[INIT] Wake por lluvia GPIO39: HABILITADO");
+  } else {
+    Serial.println("[INIT] Wake por lluvia GPIO39: DESHABILITADO");
+  }
+
+  // Verificar razón de wake up
+  wakeup_reason();
+}
+
+/* ================== MAIN LOOP ==================*/
+void loop() {
+  // Modo configuración (Access Point)
+  if (serverReady) {
+    static bool serverStarted = false;
+    static unsigned long serverStartTime = 0;
+
+    if (!serverStarted) {
+      if (serverStartTime == 0) {
+        serverStartTime = millis();
+        Serial.println("[LOOP] Esperando estabilización del AP...");
+      }
+
+      if (millis() - serverStartTime < 3000) {
+        delay(100);
+        return;
+      }
+
+      if (WiFi.getMode() != WIFI_AP) {
+        Serial.println("[ERROR] WiFi AP no está activo!");
+        ESP.restart();
+        return;
+      }
+
+      server.begin();
+      serverStarted = true;
+
+      Serial.println("================================");
+      Serial.printf("   SSID: %s\n", ssid);
+      Serial.printf("   Pass: %s\n", password);
+      Serial.println("   URL: http://192.168.4.1");
+      Serial.println("================================\n");
+
+    }
+
+    // updateSensCache() ya no bloquea (viento por interrupción, DHT por temporizador
+    // interno): se llama en cada vuelta de loop() para lecturas casi en tiempo real.
+    updateSensCache();
+
+    delay(20);
+    return;
+  }
+
+  // Modo operación normal
+  static unsigned long lastCheck = 0;
+
+  if (!checkMQTT()) {
+    if (millis() - lastCheck > 5000) {
+      if (connectionType == "WIFI") {
+        wifiReconnect();
+      } else if (connectionType == "LTE") {
+        simReconnect();
+      }
+      lastCheck = millis();
+    }
+  }
+
+  if (connectionType == "WIFI") {
+    if (!wificlient.connected()) {
+      wifiReconnect();
+    }
+    wificlient.loop();
+  } else if (connectionType == "LTE") {
+    if (!simclient.connected()) {
+      simReconnect();
+    }
+    simclient.loop();
+  }
+
+  // Timeout - entrar en deep sleep si no hay actividad
+  if ((millis() - previousTime) > 90000) {
+    Serial.println("[TIMEOUT] Entrando en deep sleep");
+    deepSleepSystem();
+  }
+
+  delay(50);
+}
