@@ -54,6 +54,12 @@ DHT dht(DHT_PIN, DHT_TYPE);
 /* ====================== SD CARD SETTINGS (VSPI) ======================== */
 #include <SPI.h>
 #include <SD.h>
+// Backend oficial ESP-IDF (empaquetado en el core arduino-esp32) usado solo
+// por formatSD() para poder formatear tarjetas sin filesystem FAT válido:
+// la librería Arduino SD.h no expone una operación de formateo.
+#include <esp_vfs_fat.h>
+#include <driver/sdspi_host.h>
+#include <sdmmc_cmd.h>
 #define SD_MISO 19
 #define SD_MOSI 23
 #define SD_SCK  18
@@ -64,6 +70,22 @@ String sdCardType = "N/A";
 uint64_t sdTotalMB = 0;
 uint64_t sdUsedMB = 0;
 uint64_t sdFreeMB = 0;
+
+#define SD_LOG_PATH "/datalog.csv"
+
+/* ================ MARCA DE TIEMPO (hora real, sin RTC chip) ================ */
+// El ESP32 no tiene un RTC con batería propia ni GPS/NTP en este hardware, así
+// que la única forma de tener hora real (no solo "segundos desde que
+// arrancó") es que el dispositivo que se conecta al AP en modo configuración
+// preste su reloj: al cargar la página se envía la hora actual del
+// navegador/teléfono a /settime, que ancla epoch (segundos Unix) contra
+// getRtcTimeSeconds() (el RTC slow-clock interno, que sí sobrevive el deep
+// sleep). Cada medición posterior calcula su hora real sumando al ancla los
+// segundos de RTC transcurridos desde que se guardó — sin depender de que la
+// conexión de red esté disponible en cada ciclo.
+uint64_t timeBaseEpoch = 0;  // epoch (s) reportado por el navegador al conectar al AP
+uint64_t timeBaseRtc = 0;    // getRtcTimeSeconds() en el instante en que se ancló
+bool timeBaseSet = false;
 
 /* ====================== WEBSERVER SETTINGS ======================== */
 #include <WiFi.h>
@@ -91,7 +113,7 @@ String RUNpass = "";
 #define TINY_GSM_USE_WIFI false
 #define GSM_PIN ""
 
-const char apn[]      = "claro.pe";
+String RUNapn = "claro.pe";  // configurable desde el portal AP, ver /apn.txt en SPIFFS
 const char gprsUser[] = "";
 const char gprsPass[] = "";
 
@@ -113,7 +135,7 @@ const char gprsPass[] = "";
 #define MODEM_PWR_PIN       15   // MOSFET canal P: LOW=ON, HIGH=OFF
 
 #define SENS_PWR_PIN        2    // MOSFET canal P: LOW=ON, HIGH=OFF (ctrl-sensors, D2 en esquemático)
-#define LED_PIN             12
+
 
 /* ============================== DEVICE CONFIGURATIONS ============================== */
 
@@ -256,6 +278,11 @@ input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(1
 .rc{background:#fff;border:2px solid #e8e8e8;border-radius:10px;padding:12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
 .rc .sv{margin:0;font-size:24px}
 @media(max-width:600px){.s{grid-template-columns:repeat(2,1fr)}.g2{grid-template-columns:1fr}}
+.dt{width:100%%;overflow-x:auto;margin-top:8px;border-radius:6px;border:1px solid #e8e8e8}
+.dt table{width:100%%;border-collapse:collapse;font-size:11px}
+.dt th,.dt td{border-bottom:1px solid #eee;padding:6px 8px;text-align:left;white-space:nowrap}
+.dt th{background:#f8f9fa;color:#2c3e50;position:sticky;top:0}
+.dt tr:hover td{background:#f8f9fa}
 </style>
 </head>
 <body>
@@ -331,10 +358,27 @@ input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(1
 <div class="sb"><div class="sl">Usado</div><div class="sv">%SD_USED% MB</div></div>
 <div class="sb"><div class="sl">Libre</div><div class="sv">%SD_FREE% MB</div></div>
 </div>
+<div class="tb" style="margin-top:10px">
+<button type="button" class="btn br" onclick="downloadSD()">&#x2B07; Descargar CSV</button>
+<button type="button" class="btn be" onclick="formatSD()">&#x1F5D1; Formatear Tarjeta</button>
+</div>
+<div id="sdResult" class="ps">Formatear borra todos los datos de la tarjeta.</div>
+</div>
+
+<div class="sc">
+<div class="ps">&#x1F551; Hora de referencia: <span id="timeBase">%TIME_BASE%</span></div>
+</div>
+
+<div class="sc">
+<h3>&#x1F4CB; Datos Registrados (últimos 50)</h3>
+<button type="button" class="btn br" style="width:100%%" onclick="loadDataTable()">&#x1F504; Cargar / Actualizar Tabla</button>
+<div class="dt" id="dataTableWrap"><div class="ps" style="padding:8px">Sin cargar aún.</div></div>
 </div>
 
 <div class="sc" id="lteCard" style="%LTE_CARD_STYLE%">
 <h3>&#x1F4E1; Diagnóstico LTE (SIM800)</h3>
+<form action="/get"><div class="fr"><label>APN</label><input type="text" name="apn" value="%apn%" placeholder="claro.pe / internet.movistar.pe"></div><input type="submit" value="Guardar"></form>
+<div class="ps">Ej: "claro.pe" para Claro, "internet.movistar.pe" para Movistar.</div>
 <button type="button" class="btn br" style="width:100%%;margin-bottom:10px" onclick="lteTest()">&#x1F4E1; Probar Conexión</button>
 <div id="lteResult" class="ps">Sin ejecutar aún. El modem se enciende solo al presionar el botón.</div>
 </div>
@@ -366,6 +410,11 @@ input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(1
 <script>
 function u(){fetch('/sensors').then(r=>r.json()).then(d=>{document.getElementById('temp').innerText=d.temp!='NA'?d.temp+'°C':'--';document.getElementById('hum').innerText=d.hum!='NA'?d.hum+'%%':'--';document.getElementById('rain').innerText=d.rain!='NA'?d.rain+' mm':'--';document.getElementById('rainStatus').innerText=d.rainStatus!='NA'?d.rainStatus:'--';document.getElementById('wvel').innerText=d.wvel!='NA'?d.wvel+' m/s':'--';document.getElementById('wdir').innerText=d.wdir!='NA'?d.wdir+'°':'--';document.getElementById('bat').innerText=d.bat||'--';var rc=document.getElementById('rainCounterVal');if(rc)rc.innerText=d.rainCount!='NA'?d.rainCount:'--';document.getElementById('upd').innerText=new Date().toLocaleTimeString();}).catch(e=>console.log(e));}
 u();setInterval(u,1000);
+function syncTime(){fetch('/settime?epoch='+Math.floor(Date.now()/1000)).then(r=>r.json()).then(d=>{var tb=document.getElementById('timeBase');if(tb&&d.ok)tb.innerText=d.timestamp+' UTC (ancla)';}).catch(e=>console.log(e));}
+syncTime();
+function formatSD(){if(!confirm('¿Formatear la tarjeta SD? Se borrarán todos los datos.'))return;var r=document.getElementById('sdResult');r.innerText='Formateando...';fetch('/formatsd').then(r=>r.json()).then(d=>{r.innerText=d.msg;}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;});}
+function downloadSD(){window.location.href='/downloadsd';}
+function loadDataTable(){var w=document.getElementById('dataTableWrap');w.innerHTML='<div class="ps" style="padding:8px">Cargando...</div>';fetch('/viewdata').then(r=>r.text()).then(t=>{var lines=t.split('\n').filter(l=>l.length>0);if(lines.length<2){w.innerHTML='<div class="ps" style="padding:8px">Sin datos registrados aún.</div>';return;}var head=lines[0].split(',');var html='<table><thead><tr>';head.forEach(h=>html+='<th>'+h+'</th>');html+='</tr></thead><tbody>';for(var i=lines.length-1;i>=1;i--){var cols=lines[i].split(',');html+='<tr>';cols.forEach(c=>html+='<td>'+c+'</td>');html+='</tr>';}html+='</tbody></table>';w.innerHTML=html;}).catch(e=>{w.innerHTML='<div class="ps" style="padding:8px">Error de comunicación: '+e+'</div>';});}
 function lteTest(){var r=document.getElementById('lteResult');r.innerText='Probando... (enciende el modem, puede tardar hasta 20 s)';fetch('/ltetest').then(r=>r.json()).then(d=>{var lines=[];if(d.modemInfo)lines.push('Modem: '+d.modemInfo);if(d.signal!=null)lines.push('Señal (CSQ): '+d.signal+(d.signal==99?' (desconocida)':''));if(d.simReady!=null)lines.push('SIM lista: '+(d.simReady?'sí':'no'));if(d.networkRegistered!=null)lines.push('Registrado en red: '+(d.networkRegistered?'sí':'no'));if(d.operator)lines.push('Operador: '+d.operator);if(d.gprsConnected!=null)lines.push('GPRS/Internet: '+(d.gprsConnected?'sí':'no'));if(d.ip)lines.push('IP: '+d.ip);lines.push(d.msg||(d.ok?'OK':'Error'));document.getElementById('lteResult').innerHTML=lines.join('<br>');}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;});}
 document.querySelectorAll('form').forEach(f=>{f.onsubmit=function(e){if(this.querySelector('input[name="resetRain"]')&&!confirm('¿Reiniciar el contador de lluvia a 0? Esta acción no se puede deshacer.')){e.preventDefault();return;}if(!this.querySelector('input[name="reset"]')){e.preventDefault();fetch('/get?'+new URLSearchParams(new FormData(this))).then(()=>location.href='/').catch(()=>location.href='/');}}});
 </script>
@@ -403,7 +452,13 @@ void readConfig();
 void initDHT22();
 void initMT6701();
 void initSD();
+bool formatSD();
 void logToSD(const String &line);
+void loadTimeBase();
+void setTimeBase(uint64_t epochSeconds);
+uint64_t getEpochNow();
+String formatTimestamp(uint64_t epochSeconds);
+String formatTimestampISO8601(uint64_t epochSeconds);
 void createDefaultConfigs();
 String readSensors();
 bool sendDataWiFi(String jsonData);
@@ -411,6 +466,10 @@ bool sendDataLTE(String jsonData);
 uint64_t getRtcTimeSeconds();
 void updateSensCache();
 void waitForConfig(PubSubClient &mqttClient);
+bool syncTimeFromInternetWiFi();
+bool syncTimeFromInternetLTE();
+void appendPendingRecord(const String &jsonLine);
+bool flushPendingData(PubSubClient &mqttClient, const String &topicPub);
 
 /* ====================== HTML SCRIPTS ======================== */
 void notFound(AsyncWebServerRequest *request) {
@@ -500,6 +559,9 @@ String processor(const String& var) {
     return readFile(SPIFFS, "/topicPub.txt");
   } else if (var == "topicSub") {
     return readFile(SPIFFS, "/topicSub.txt");
+  } else if (var == "apn") {
+    String v = readFile(SPIFFS, "/apn.txt");
+    return (v == "") ? "claro.pe" : v;
   } else if (var == "MAC") {
     return macA();
   } else if (var == "WIFI_SELECTED") {
@@ -552,6 +614,8 @@ String processor(const String& var) {
   } else if (var == "LTE_CARD_STYLE") {
     String connType = readFile(SPIFFS, "/connType.txt");
     return (connType == "LTE") ? "" : "display:none";
+  } else if (var == "TIME_BASE") {
+    return timeBaseSet ? formatTimestamp(timeBaseEpoch) + " UTC (ancla)" : "Sin sincronizar";
   }
   return String();
 }
@@ -559,8 +623,10 @@ String processor(const String& var) {
 /* ====================== SD CARD ======================== */
 void initSD() {
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  if (!SD.begin(SD_CS)) {
-    Serial.println("[SD] Error al montar la tarjeta SD");
+  // Reintento a 400 kHz: cableado marginal (protoboard/cables largos) suele
+  // fallar a la velocidad por defecto (4 MHz) pero responde a baja velocidad.
+  if (!SD.begin(SD_CS) && !SD.begin(SD_CS, SPI, 400000)) {
+    Serial.println("[SD] Error al montar la tarjeta SD (probado a 4 MHz y 400 kHz)");
     sdReady = false;
     sdCardType = "N/A";
     sdTotalMB = sdUsedMB = sdFreeMB = 0;
@@ -584,15 +650,288 @@ void initSD() {
                 sdCardType.c_str(), sdTotalMB, sdUsedMB, sdFreeMB);
 }
 
-void logToSD(const String &line) {
+// Formatea la tarjeta SD como FAT (destructivo: borra todos los datos).
+// Usa el driver oficial ESP-IDF esp_vfs_fat_sdspi_mount con
+// format_if_mount_failed=true, ya que la librería Arduino SD.h no puede
+// formatear: si SD.begin() nunca detecta la tarjeta, no hay filesystem
+// FAT válido que montar y por tanto nada que la librería Arduino pueda leer.
+bool formatSD() {
+  Serial.println("[SD] Formateando tarjeta...");
+
+  // Liberar el bus VSPI que usa la librería Arduino SD antes de remontar
+  // con el driver ESP-IDF (ambos necesitan control exclusivo del CS/SPI).
+  SD.end();
+  SPI.end();
+
+  sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+  spi_bus_config_t busCfg = {
+    .mosi_io_num = SD_MOSI,
+    .miso_io_num = SD_MISO,
+    .sclk_io_num = SD_SCK,
+    .quadwp_io_num = -1,
+    .quadhd_io_num = -1,
+    .max_transfer_sz = 4000,
+  };
+  esp_err_t ret = spi_bus_initialize((spi_host_device_t)host.slot, &busCfg, SDSPI_DEFAULT_DMA);
+  if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+    Serial.printf("[SD] Error iniciando bus SPI: %d\n", ret);
+    SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    return false;
+  }
+
+  sdspi_device_config_t slotCfg = SDSPI_DEVICE_CONFIG_DEFAULT();
+  slotCfg.gpio_cs = (gpio_num_t)SD_CS;
+  slotCfg.host_id = (spi_host_device_t)host.slot;
+
+  esp_vfs_fat_sdmmc_mount_config_t mountCfg = {
+    .format_if_mount_failed = true,
+    .max_files = 2,
+    .allocation_unit_size = 16 * 1024,
+  };
+
+  sdmmc_card_t *card = nullptr;
+  ret = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slotCfg, &mountCfg, &card);
+
+  bool ok = (ret == ESP_OK);
+  if (ok) {
+    Serial.println("[SD] Formateo OK");
+    esp_vfs_fat_sdcard_unmount("/sdcard", card);
+  } else {
+    Serial.printf("[SD] Formateo falló: %s\n", esp_err_to_name(ret));
+  }
+
+  spi_bus_free((spi_host_device_t)host.slot);
+
+  // Volver a montar con la librería Arduino SD para uso normal.
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  initSD();
+
+  return ok;
+}
+
+// Respaldo en la tarjeta microSD física, en formato CSV con marca de tiempo.
+// jsonLine es el mismo payload publicado por MQTT (ver readSensors()).
+void logToSD(const String &jsonLine) {
   if (!sdReady) return;
-  File f = SD.open("/datalog.txt", FILE_APPEND);
+
+  bool isNew = !SD.exists(SD_LOG_PATH);
+  File f = SD.open(SD_LOG_PATH, FILE_APPEND);
   if (!f) {
-    Serial.println("[SD] Error abriendo /datalog.txt");
+    Serial.println("[SD] Error abriendo " SD_LOG_PATH);
     return;
   }
-  f.println(line);
+
+  if (isNew) {
+    f.println("timestamp,epoch_s,mac,conn,T,H,WV,WD,RA,vB");
+  }
+
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, jsonLine);
+  if (err) {
+    Serial.println("[SD] Error parseando JSON para CSV: " + String(err.c_str()));
+    f.close();
+    return;
+  }
+
+  uint64_t epochNow = getEpochNow();
+  String row = formatTimestamp(epochNow);
+  row += ","; row += String((unsigned long)epochNow);
+  row += ","; row += doc["mac"].as<String>();
+  row += ","; row += doc["conn"].as<String>();
+  row += ","; row += doc["T"].as<String>();
+  row += ","; row += doc["H"].as<String>();
+  row += ","; row += doc["WV"].as<String>();
+  row += ","; row += doc["WD"].as<String>();
+  row += ","; row += doc["RA"].as<String>();
+  row += ","; row += doc["vB"].as<String>();
+
+  f.println(row);
   f.close();
+}
+
+/* ================ MARCA DE TIEMPO (hora real) ================ */
+void loadTimeBase() {
+  timeBaseEpoch = (uint64_t)readFile(SPIFFS, "/timeBaseEpoch.txt").toInt();
+  timeBaseRtc = (uint64_t)readFile(SPIFFS, "/timeBaseRtc.txt").toInt();
+  timeBaseSet = timeBaseEpoch > 0;
+  if (timeBaseSet) {
+    Serial.printf("[TIME] Ancla cargada: epoch=%llu rtc=%llu\n", timeBaseEpoch, timeBaseRtc);
+  } else {
+    Serial.println("[TIME] Sin ancla de hora real guardada (aún no se conectó ningún dispositivo al AP)");
+  }
+}
+
+// Ancla la hora real contra el RTC interno. Se llama desde /settime, con el
+// epoch (segundos Unix, UTC) que envía el navegador/teléfono conectado al AP.
+void setTimeBase(uint64_t epochSeconds) {
+  timeBaseEpoch = epochSeconds;
+  timeBaseRtc = getRtcTimeSeconds();
+  timeBaseSet = true;
+  writeFile(SPIFFS, "/timeBaseEpoch.txt", String((unsigned long)timeBaseEpoch).c_str());
+  writeFile(SPIFFS, "/timeBaseRtc.txt", String((unsigned long)timeBaseRtc).c_str());
+  Serial.printf("[TIME] Ancla actualizada: epoch=%llu rtc=%llu\n", timeBaseEpoch, timeBaseRtc);
+}
+
+// Hora real estimada "ahora mismo": ancla + segundos de RTC transcurridos
+// desde que se guardó. Si nunca se estableció el ancla, devuelve 0 (el
+// llamador debe usar formatTimestamp/logToSD con ese caso en mente).
+uint64_t getEpochNow() {
+  if (!timeBaseSet) return 0;
+  uint64_t nowRtc = getRtcTimeSeconds();
+  uint64_t elapsed = (nowRtc > timeBaseRtc) ? (nowRtc - timeBaseRtc) : 0;
+  return timeBaseEpoch + elapsed;
+}
+
+String formatTimestamp(uint64_t epochSeconds) {
+  if (epochSeconds == 0) return "NA";
+  time_t t = (time_t)epochSeconds;
+  struct tm tmStruct;
+  gmtime_r(&t, &tmStruct);
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+           tmStruct.tm_year + 1900, tmStruct.tm_mon + 1, tmStruct.tm_mday,
+           tmStruct.tm_hour, tmStruct.tm_min, tmStruct.tm_sec);
+  return String(buf);
+}
+
+// Igual que formatTimestamp() pero en ISO 8601 (YYYY-MM-DDTHH:MM:SS, UTC),
+// formato esperado por el backend (Postgres/Django) para el campo "timestamp".
+String formatTimestampISO8601(uint64_t epochSeconds) {
+  if (epochSeconds == 0) return "NA";
+  time_t t = (time_t)epochSeconds;
+  struct tm tmStruct;
+  gmtime_r(&t, &tmStruct);
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
+           tmStruct.tm_year + 1900, tmStruct.tm_mon + 1, tmStruct.tm_mday,
+           tmStruct.tm_hour, tmStruct.tm_min, tmStruct.tm_sec);
+  return String(buf);
+}
+
+/* ============ SINCRONIZACIÓN DE HORA POR INTERNET (NTP / red LTE) ============ */
+// Se llama únicamente tras un publish MQTT exitoso (WiFi ya asociada o GPRS ya
+// conectado), para no gastar tiempo/energía intentándolo si no hay red.
+// Actualiza el ancla de hora real (setTimeBase) que ya usa formatTimestamp/SD.
+
+bool syncTimeFromInternetWiFi() {
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  struct tm tmStruct;
+  if (!getLocalTime(&tmStruct, 5000)) {
+    Serial.println("[TIME] NTP (WiFi) sin respuesta, se mantiene ancla anterior");
+    return false;
+  }
+  time_t epoch = mktime(&tmStruct) ; // mktime asume tm en tiempo local; configTime(0,0,...) => UTC
+  setTimeBase((uint64_t)epoch);
+  Serial.println("[TIME] Hora sincronizada por NTP (WiFi)");
+  return true;
+}
+
+bool syncTimeFromInternetLTE() {
+  int year, month, day, hour, minute, second;
+  float timezoneOffset;
+  if (!modem.getNetworkTime(&year, &month, &day, &hour, &minute, &second, &timezoneOffset)) {
+    Serial.println("[TIME] Hora de red (LTE) no disponible, se mantiene ancla anterior");
+    return false;
+  }
+  struct tm tmStruct = {};
+  tmStruct.tm_year = year - 1900;
+  tmStruct.tm_mon  = month - 1;
+  tmStruct.tm_mday = day;
+  tmStruct.tm_hour = hour;
+  tmStruct.tm_min  = minute;
+  tmStruct.tm_sec  = second;
+  // getNetworkTime() devuelve hora LOCAL de red + offset horario (en horas).
+  // mktime() interpreta tmStruct como tiempo local, pero el ESP32 no tiene TZ
+  // configurada (por defecto UTC), así que su resultado ya equivale a tratar
+  // los campos como si fueran UTC — igual que timegm(), que no está disponible
+  // en este toolchain. Solo falta restar el offset horario para obtener UTC real.
+  time_t localAsUtc = mktime(&tmStruct);
+  time_t epoch = localAsUtc - (time_t)(timezoneOffset * 3600.0f);
+  setTimeBase((uint64_t)epoch);
+  Serial.println("[TIME] Hora sincronizada por red LTE");
+  return true;
+}
+
+/* ====== ALMACENAMIENTO Y REENVÍO (SPIFFS, JSON Lines) ====== */
+// Si el envío de una lectura falla (sin red o publish rechazado), el JSON
+// completo (ya con su campo "timestamp") se guarda como una línea más en
+// este archivo. En el próximo ciclo con conexión exitosa, flushPendingData()
+// reenvía todo lo pendiente, en orden cronológico, antes del dato actual.
+#define PENDING_LOG_PATH "/pending.jsonl"
+#define PENDING_LOG_TMP  "/pending.tmp"
+
+void appendPendingRecord(const String &jsonLine) {
+  File f = SPIFFS.open(PENDING_LOG_PATH, FILE_APPEND);
+  if (!f) {
+    Serial.println("[PENDING] Error abriendo " PENDING_LOG_PATH " para escritura");
+    return;
+  }
+  f.println(jsonLine);
+  f.close();
+  Serial.println("[PENDING] Lectura guardada para reenvío posterior");
+}
+
+// Reenvía, en orden, los registros pendientes por el mismo cliente MQTT ya
+// conectado. Lectura/escritura secuencial línea por línea (sin cargar el
+// archivo completo en RAM). Si una publicación falla, se detiene ahí mismo
+// y conserva en el archivo esa línea y todas las siguientes para el próximo
+// intento. Devuelve true si no quedó ningún pendiente (o no había ninguno).
+bool flushPendingData(PubSubClient &mqttClient, const String &topicPub) {
+  if (!SPIFFS.exists(PENDING_LOG_PATH)) return true;
+
+  File in = SPIFFS.open(PENDING_LOG_PATH, FILE_READ);
+  if (!in) {
+    Serial.println("[PENDING] Error abriendo " PENDING_LOG_PATH " para lectura");
+    return false;
+  }
+
+  SPIFFS.remove(PENDING_LOG_TMP);
+  File out;
+  bool outOpen = false;
+  bool stoppedEarly = false;
+  int sentCount = 0, keptCount = 0;
+
+  while (in.available()) {
+    String line = in.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    if (!stoppedEarly && mqttClient.connected() &&
+        mqttClient.publish(topicPub.c_str(), line.c_str())) {
+      sentCount++;
+      mqttClient.loop();
+      continue;
+    }
+
+    // No se pudo enviar esta línea: a partir de aquí se conserva todo tal cual,
+    // sin volver a intentar publicar, para no reordenar los registros.
+    stoppedEarly = true;
+    if (!outOpen) {
+      out = SPIFFS.open(PENDING_LOG_TMP, FILE_WRITE);
+      outOpen = (bool)out;
+    }
+    if (outOpen) {
+      out.println(line);
+      keptCount++;
+    }
+  }
+  in.close();
+  if (outOpen) out.close();
+
+  if (stoppedEarly && keptCount > 0) {
+    SPIFFS.remove(PENDING_LOG_PATH);
+    SPIFFS.rename(PENDING_LOG_TMP, PENDING_LOG_PATH);
+    Serial.printf("[PENDING] %d reenviados, %d conservados para el próximo intento\n", sentCount, keptCount);
+    return false;
+  }
+
+  // Todo se envió correctamente (o no quedó nada por conservar): limpiar.
+  SPIFFS.remove(PENDING_LOG_PATH);
+  SPIFFS.remove(PENDING_LOG_TMP);
+  if (sentCount > 0) {
+    Serial.printf("[PENDING] %d registros pendientes reenviados correctamente\n", sentCount);
+  }
+  return true;
 }
 
 /* ========================= DEEP SLEEP ========================= */
@@ -617,12 +956,6 @@ void deepSleepSystem() {
   // WiFi el modem nunca se enciende, así que sin esto estos pines
   // quedarían en su estado flotante por defecto durante todo el sleep.
   modemLinesOff();
-
-  // ===== LED =====
-  gpio_hold_dis((gpio_num_t)LED_PIN);
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);  // LED apagado en sleep
-  gpio_hold_en((gpio_num_t)LED_PIN);
 
   // Leer tiempo de sleep
   TIME_TO_SLEEP = readFile(SPIFFS, "/timesleep.txt").toInt();
@@ -737,7 +1070,7 @@ void setupServerRoutes() {
 
     doc["operator"] = modem.getOperator();
 
-    bool gprsOk = modem.gprsConnect(apn);
+    bool gprsOk = modem.gprsConnect(RUNapn.c_str());
     doc["gprsConnected"] = gprsOk;
 
     if (gprsOk) {
@@ -746,7 +1079,7 @@ void setupServerRoutes() {
       doc["msg"] = "Conexión a internet OK";
       modem.gprsDisconnect();
     } else {
-      doc["msg"] = "Registrado en red, pero falló GPRS (revisar APN: " + String(apn) + ")";
+      doc["msg"] = "Registrado en red, pero falló GPRS (revisar APN: " + RUNapn + ")";
     }
 
     modemPowerOff();
@@ -755,6 +1088,97 @@ void setupServerRoutes() {
     serializeJson(doc, response);
     request->send(200, "application/json", response);
     Serial.println("[LTE TEST] Fin diagnóstico");
+  });
+
+  // Formateo de SD bajo demanda (bloqueante, botón manual, destructivo).
+  server.on("/formatsd", HTTP_GET, [](AsyncWebServerRequest *request) {
+    bool ok = formatSD();
+    StaticJsonDocument<256> doc;
+    doc["ok"] = ok;
+    doc["msg"] = ok ? "Formateo completado, tarjeta lista" : "Formateo falló (revisar cableado/tarjeta)";
+    doc["sdPresent"] = sdReady;
+    doc["sdType"] = sdCardType;
+    doc["sdTotal"] = (unsigned long)sdTotalMB;
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
+  // Descarga del respaldo en la tarjeta microSD física, en formato CSV.
+  server.on("/downloadsd", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!sdReady || !SD.exists(SD_LOG_PATH)) {
+      request->send(404, "text/plain", "No hay datos disponibles en la SD");
+      return;
+    }
+    AsyncWebServerResponse *response = request->beginResponse(SD, SD_LOG_PATH, "text/csv");
+    response->addHeader("Content-Disposition", "attachment; filename=datalog.csv");
+    request->send(response);
+  });
+
+  // Últimas filas del respaldo en la SD en texto plano (CSV) para pintar una
+  // tabla en el portal AP, sin cargar el archivo completo en memoria: se
+  // recorre línea a línea y solo se retiene un buffer circular de las
+  // últimas MAX_ROWS.
+  server.on("/viewdata", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!sdReady || !SD.exists(SD_LOG_PATH)) {
+      request->send(200, "text/plain", "");
+      return;
+    }
+
+    const int MAX_ROWS = 50;
+    File f = SD.open(SD_LOG_PATH, FILE_READ);
+    String header;
+    String ring[MAX_ROWS];
+    int count = 0;
+    bool first = true;
+
+    while (f.available()) {
+      String line = f.readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0) continue;
+      if (first) {
+        header = line;
+        first = false;
+        continue;
+      }
+      ring[count % MAX_ROWS] = line;
+      count++;
+    }
+    f.close();
+
+    String out = header + "\n";
+    int shown = (count < MAX_ROWS) ? count : MAX_ROWS;
+    int startCount = count - shown;
+    for (int i = 0; i < shown; i++) {
+      out += ring[(startCount + i) % MAX_ROWS] + "\n";
+    }
+
+    request->send(200, "text/plain", out);
+  });
+
+  // Recibe la hora actual (epoch, segundos Unix UTC) del dispositivo
+  // conectado al AP, para anclar la marca de tiempo real de las mediciones
+  // (ver setTimeBase()). Lo llama el JS del portal automáticamente al cargar.
+  server.on("/settime", HTTP_GET, [](AsyncWebServerRequest *request) {
+    StaticJsonDocument<128> doc;
+    if (!request->hasParam("epoch")) {
+      doc["ok"] = false;
+      doc["msg"] = "Falta parámetro epoch";
+    } else {
+      uint64_t epoch = strtoull(request->getParam("epoch")->value().c_str(), nullptr, 10);
+      if (epoch < 1000000000ULL) {  // sanity check: antes de 2001 => inválido
+        doc["ok"] = false;
+        doc["msg"] = "epoch inválido";
+      } else {
+        setTimeBase(epoch);
+        doc["ok"] = true;
+        doc["msg"] = "Hora sincronizada";
+        doc["timestamp"] = formatTimestamp(epoch);
+      }
+    }
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
   });
 
   server.on("/get", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -795,6 +1219,12 @@ void setupServerRoutes() {
       String val = request->getParam("topicSub")->value();
       writeFile(SPIFFS, "/topicSub.txt", val.c_str());
       Serial.println("[SAVE] Topic Subscribe: " + val);
+    }
+    else if (request->hasParam("apn")) {
+      String val = request->getParam("apn")->value();
+      writeFile(SPIFFS, "/apn.txt", val.c_str());
+      RUNapn = val;
+      Serial.println("[SAVE] APN: " + val);
     }
     else if (request->hasParam("dirSensor")) {
       String val = request->getParam("dirSensor")->value();
@@ -838,6 +1268,12 @@ void setting() {
 
   // Detener I2C
   Wire.end();
+
+  // Montar SD (VSPI: MISO19/MOSI23/SCK18/CS5)
+  initSD();
+
+  // Cargar el ancla de hora real (ver /settime, setTimeBase())
+  loadTimeBase();
 
   // Desconectar WiFi completamente
   WiFi.disconnect(true);
@@ -1028,6 +1464,14 @@ void runRainCounter() {
 }
 
 /* ====================== READ DHT22 ======================== */
+// Rango físico del DHT22/AM2301 según datasheet: la lectura se descarta
+// (success=false) si cae fuera de estos límites, para que el llamador
+// vuelva a pedir el dato en vez de propagar un valor imposible.
+#define DHT22_TEMP_MIN -40.0f
+#define DHT22_TEMP_MAX 80.0f
+#define DHT22_HUM_MIN 0.0f
+#define DHT22_HUM_MAX 100.0f
+
 void readDHT22(float &temperature, float &humidity, bool &success) {
   success = false;
   temperature = -999;
@@ -1036,13 +1480,19 @@ void readDHT22(float &temperature, float &humidity, bool &success) {
   float t = dht.readTemperature();
   float h = dht.readHumidity();
 
-  if (!isnan(t) && !isnan(h)) {
-    temperature = t;
-    humidity    = h;
-    success     = true;
-  } else {
+  if (isnan(t) || isnan(h)) {
     Serial.println("[DHT22] Error de lectura");
+    return;
   }
+
+  if (t < DHT22_TEMP_MIN || t > DHT22_TEMP_MAX || h < DHT22_HUM_MIN || h > DHT22_HUM_MAX) {
+    Serial.printf("[DHT22] Lectura fuera de rango, descartada (T=%.2f H=%.2f)\n", t, h);
+    return;
+  }
+
+  temperature = t;
+  humidity    = h;
+  success     = true;
 }
 
 /* ====================== WIND FUNCTIONS ======================== */
@@ -1368,10 +1818,11 @@ void wakeup_reason() {
 String readSensors() {
   Serial.println("\n[SENSORS] Iniciando lectura de sensores...");
 
-  DynamicJsonDocument docOut(256);
+  DynamicJsonDocument docOut(384);
   docOut["type"] = "weatherStationData";
   docOut["mac"] = macA();
   docOut["conn"] = connectionType;
+  docOut["timestamp"] = formatTimestampISO8601(getEpochNow());
 
   // Encender sensores: MOSFET canal P gate LOW = ON
   pinMode(SENS_PWR_PIN, OUTPUT);
@@ -1508,7 +1959,7 @@ bool sendDataLTE(String jsonData) {
 
   // Conectar GPRS
   Serial.println("[LTE] Conectando GPRS...");
-  if (!modem.gprsConnect(apn)) {
+  if (!modem.gprsConnect(RUNapn.c_str())) {
     Serial.println("[ERROR] Fallo conexión GPRS");
     modemPowerOff();
     return false;
@@ -1556,11 +2007,16 @@ bool sendDataLTE(String jsonData) {
   simclient.subscribe(cfgTopic.c_str());
   Serial.printf("[CONFIG] Suscrito a: %s\n", cfgTopic.c_str());
 
+  // Reenviar primero cualquier lectura pendiente de ciclos anteriores sin
+  // conexión, en orden cronológico, antes del dato de este ciclo.
+  flushPendingData(simclient, topicPub);
+
   // Publicar datos
   bool published = simclient.publish(topicPub.c_str(), jsonData.c_str());
 
   if (published) {
     Serial.println("[MQTT] Datos publicados correctamente");
+    syncTimeFromInternetLTE();
   } else {
     Serial.println("[ERROR] Fallo al publicar");
   }
@@ -1651,11 +2107,16 @@ bool sendDataWiFi(String jsonData) {
   wificlient.subscribe(cfgTopic.c_str());
   Serial.printf("[CONFIG] Suscrito a: %s\n", cfgTopic.c_str());
 
+  // Reenviar primero cualquier lectura pendiente de ciclos anteriores sin
+  // conexión, en orden cronológico, antes del dato de este ciclo.
+  flushPendingData(wificlient, topicPub);
+
   // Publicar datos
   bool published = wificlient.publish(topicPub.c_str(), jsonData.c_str());
 
   if (published) {
     Serial.println("[MQTT] Datos publicados correctamente");
+    syncTimeFromInternetWiFi();
   } else {
     Serial.println("[ERROR] Fallo al publicar");
   }
@@ -1708,7 +2169,7 @@ void init_running() {
 
     String sensorData = readSensors();
 
-    // Respaldo local en la SD, independientemente de si el envío MQTT funciona
+    // Respaldo local en la SD, independientemente de si el envío MQTT funciona.
     logToSD(sensorData);
 
     bool success = false;
@@ -1725,6 +2186,7 @@ void init_running() {
       Serial.println("[OK] Datos enviados correctamente");
     } else {
       Serial.println("[ERROR] Fallo al enviar datos");
+      appendPendingRecord(sensorData);
     }
 
     // Entrar en deep sleep
@@ -1748,11 +2210,15 @@ void readConfig() {
   A_PR = (apr == "1");
   dirSensorType = (dirSensor == "AS5600") ? "AS5600" : "MT6701";
 
+  String apnCfg = readFile(SPIFFS, "/apn.txt");
+  RUNapn = (apnCfg == "") ? "claro.pe" : apnCfg;
+
   Serial.println("---- VALORES CARGADOS ----");
   Serial.printf("A_TH = %s\n", A_TH ? "true" : "false");
   Serial.printf("A_WS = %s\n", A_WS ? "true" : "false");
   Serial.printf("A_PR = %s\n", A_PR ? "true" : "false");
-  Serial.printf("dirSensorType = %s\n\n", dirSensorType.c_str());
+  Serial.printf("dirSensorType = %s\n", dirSensorType.c_str());
+  Serial.printf("RUNapn = %s\n\n", RUNapn.c_str());
 }
 
 /* ================== INIT SENSORS ==================*/
@@ -1947,6 +2413,7 @@ void createDefaultConfigs() {
     {"/A_PR.txt", "0"},
     {"/dirSensor.txt", "MT6701"},
     {"/connType.txt", "WIFI"},
+    {"/apn.txt", "claro.pe"},
     {"/timesleep.txt", "300"},
     {"/ssidRainCounter.txt", "0"},
     {"/ssidString.txt", ""},
@@ -1955,7 +2422,9 @@ void createDefaultConfigs() {
     {"/port.txt", "8000"},
     {"/topicPub.txt", "jhpAI/FAUNA/data"},
     {"/topicSub.txt", "jhpAI/FAUNA/settings"},
-    {"/status.txt", "1"}
+    {"/status.txt", "1"},
+    {"/timeBaseEpoch.txt", "0"},
+    {"/timeBaseRtc.txt", "0"}
   };
 
   int numConfigs = sizeof(configs) / sizeof(configs[0]);
@@ -1983,7 +2452,6 @@ void setup() {
   gpio_deep_sleep_hold_dis();
   gpio_hold_dis((gpio_num_t)MODEM_PWR_PIN);
   gpio_hold_dis((gpio_num_t)SENS_PWR_PIN);
-  gpio_hold_dis((gpio_num_t)LED_PIN);
   gpio_hold_dis((gpio_num_t)PIN_TX2);
   gpio_hold_dis((gpio_num_t)PIN_RX2);
 
@@ -2043,6 +2511,9 @@ void setup() {
 
   // Montar SD (VSPI: MISO19/MOSI23/SCK18/CS5)
   initSD();
+
+  // Cargar el ancla de hora real (ver /settime, setTimeBase())
+  loadTimeBase();
 
   createDefaultConfigs();
 
