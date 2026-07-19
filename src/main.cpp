@@ -1853,9 +1853,11 @@ String readSensors() {
     } while (!ok && retries < 5);
 
     if (ok) {
-      docOut["T"] = String(temp, 2);
-      docOut["H"] = String(hum, 2);
-      Serial.printf("[SENSOR] Temp: %.2f°C, Hum: %.2f%%\n", temp, hum);
+      float tempCal = 0.5480f * temp + 9.0357f;
+      float humCal  = 0.4499f * hum + 54.7577f;
+      docOut["T"] = String(tempCal, 2);
+      docOut["H"] = String(humCal, 2);
+      Serial.printf("[SENSOR] Temp: %.2f°C, Hum: %.2f%%\n", tempCal, humCal);
     } else {
       docOut["T"] = "error";
       docOut["H"] = "error";
@@ -1871,9 +1873,11 @@ String readSensors() {
     float wv = WindVelocity();
     float wd = WindDirection();
 
-    docOut["WV"] = String(wv, 2);
+    float wvCal = 0.6448f * wv + 0.5343f;
+
+    docOut["WV"] = String(wvCal, 2);
     docOut["WD"] = String(wd, 1);
-    Serial.printf("[SENSOR] Vel: %.2f m/s, Dir: %.1f°\n", wv, wd);
+    Serial.printf("[SENSOR] Vel: %.2f m/s, Dir: %.1f°\n", wvCal, wd);
   }
 
   // ===== PRECIPITACIÓN =====
