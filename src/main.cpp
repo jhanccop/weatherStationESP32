@@ -15,7 +15,7 @@
  *   Viento   : GPIO13/D13 (velocidad por pulsos), MT6701 o AS5600 por I2C (SDA=21/SCL=22)
  *              para dirección — se elige por software (dirSensorType, /dirSensor.txt)
  *   DHT      : GPIO4 (DHT22)
- *   Batería  : GPIO34 (ADC), divisor 100k/100k
+ *   Batería  : GPIO34 (ADC), divisor 100k/100k.  
  *   Botón AP : GPIO36 (modo configuración si está en LOW al arrancar).
  *              Entrada solo-lectura SIN pull interno: requiere resistencia
  *              pull-up EXTERNA a 3.3V; el botón conecta a GND al presionarlo.
@@ -27,6 +27,7 @@
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
 #include <esp_sleep.h>
+#include <esp_task_wdt.h>
 
 #include "soc/rtc.h"
 
@@ -359,10 +360,15 @@ input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(1
 <div class="sb"><div class="sl">Libre</div><div class="sv">%SD_FREE% MB</div></div>
 </div>
 <div class="tb" style="margin-top:10px">
+<button type="button" class="btn br heavy-btn" onclick="logNow()">&#x1F4DD; Guardar Lectura Ahora</button>
 <button type="button" class="btn br" onclick="downloadSD()">&#x2B07; Descargar CSV</button>
-<button type="button" class="btn be" onclick="formatSD()">&#x1F5D1; Formatear Tarjeta</button>
 </div>
-<div id="sdResult" class="ps">Formatear borra todos los datos de la tarjeta.</div>
+<div class="tb" style="margin-top:8px">
+<button type="button" class="btn br heavy-btn" onclick="loadSDFileList()">&#x1F4C2; Ver Archivos SD</button>
+<button type="button" class="btn be heavy-btn" onclick="formatSD()">&#x1F5D1; Formatear Tarjeta</button>
+</div>
+<div id="sdResult" class="ps">"Guardar Lectura Ahora" agrega una fila real a la SD sin esperar el ciclo de sleep — útil para probar mientras se está en el portal. Formatear borra todos los datos de la tarjeta.</div>
+<div class="dt" id="sdFileListWrap" style="margin-top:8px"></div>
 </div>
 
 <div class="sc">
@@ -379,7 +385,7 @@ input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(1
 <h3>&#x1F4E1; Diagnóstico LTE (SIM800)</h3>
 <form action="/get"><div class="fr"><label>APN</label><input type="text" name="apn" value="%apn%" placeholder="claro.pe / internet.movistar.pe"></div><input type="submit" value="Guardar"></form>
 <div class="ps">Ej: "claro.pe" para Claro, "internet.movistar.pe" para Movistar.</div>
-<button type="button" class="btn br" style="width:100%%;margin-bottom:10px" onclick="lteTest()">&#x1F4E1; Probar Conexión</button>
+<button type="button" class="btn br heavy-btn" style="width:100%%;margin-bottom:10px" onclick="lteTest()">&#x1F4E1; Probar Conexión</button>
 <div id="lteResult" class="ps">Sin ejecutar aún. El modem se enciende solo al presionar el botón.</div>
 </div>
 
@@ -389,7 +395,9 @@ input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(1
 <select name="connType">
 <option value="WIFI" %WIFI_SELECTED%>WiFi</option>
 <option value="LTE" %LTE_SELECTED%>LTE</option>
+<option value="DATALOGER" %DATALOGER_SELECTED%>Dataloger local (solo SD, sin envío)</option>
 </select>
+<div class="ps">En "Dataloger local" el equipo no enciende WiFi ni el modem: cada lectura solo se guarda en la SD, con la hora ancla de abajo.</div>
 <input type="submit" value="Guardar">
 </form>
 <div class="g2">
@@ -408,14 +416,25 @@ input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(1
 </div>
 </div>
 <script>
-function u(){fetch('/sensors').then(r=>r.json()).then(d=>{document.getElementById('temp').innerText=d.temp!='NA'?d.temp+'°C':'--';document.getElementById('hum').innerText=d.hum!='NA'?d.hum+'%%':'--';document.getElementById('rain').innerText=d.rain!='NA'?d.rain+' mm':'--';document.getElementById('rainStatus').innerText=d.rainStatus!='NA'?d.rainStatus:'--';document.getElementById('wvel').innerText=d.wvel!='NA'?d.wvel+' m/s':'--';document.getElementById('wdir').innerText=d.wdir!='NA'?d.wdir+'°':'--';document.getElementById('bat').innerText=d.bat||'--';var rc=document.getElementById('rainCounterVal');if(rc)rc.innerText=d.rainCount!='NA'?d.rainCount:'--';document.getElementById('upd').innerText=new Date().toLocaleTimeString();}).catch(e=>console.log(e));}
+// El equipo atiende una sola solicitud lenta a la vez (lectura de sensores,
+// formateo, prueba LTE): mientras alguna esté en curso se pausa el polling
+// de /sensors cada 1 s y se bloquean los demás botones "pesados", porque el
+// AP del ESP32 solo soporta unas pocas conexiones TCP simultáneas — sin
+// esto, el polling de fondo satura esas conexiones durante los ~15-20 s que
+// tarda una lectura completa y las peticiones nuevas (de otro botón, o el
+// mismo polling) terminan en "Failed to fetch" aunque el equipo siga vivo.
+var busy=false;
+function setBusy(b){busy=b;document.querySelectorAll('.heavy-btn').forEach(function(el){el.disabled=b;});}
+function u(){if(busy)return;fetch('/sensors').then(r=>r.json()).then(d=>{document.getElementById('temp').innerText=d.temp!='NA'?d.temp+'°C':'--';document.getElementById('hum').innerText=d.hum!='NA'?d.hum+'%%':'--';document.getElementById('rain').innerText=d.rain!='NA'?d.rain+' mm':'--';document.getElementById('rainStatus').innerText=d.rainStatus!='NA'?d.rainStatus:'--';document.getElementById('wvel').innerText=d.wvel!='NA'?d.wvel+' m/s':'--';document.getElementById('wdir').innerText=d.wdir!='NA'?d.wdir+'°':'--';document.getElementById('bat').innerText=d.bat||'--';var rc=document.getElementById('rainCounterVal');if(rc)rc.innerText=d.rainCount!='NA'?d.rainCount:'--';document.getElementById('upd').innerText=new Date().toLocaleTimeString();}).catch(e=>console.log(e));}
 u();setInterval(u,1000);
 function syncTime(){fetch('/settime?epoch='+Math.floor(Date.now()/1000)).then(r=>r.json()).then(d=>{var tb=document.getElementById('timeBase');if(tb&&d.ok)tb.innerText=d.timestamp+' UTC (ancla)';}).catch(e=>console.log(e));}
 syncTime();
-function formatSD(){if(!confirm('¿Formatear la tarjeta SD? Se borrarán todos los datos.'))return;var r=document.getElementById('sdResult');r.innerText='Formateando...';fetch('/formatsd').then(r=>r.json()).then(d=>{r.innerText=d.msg;}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;});}
-function downloadSD(){window.location.href='/downloadsd';}
+function formatSD(){if(busy)return;if(!confirm('¿Formatear la tarjeta SD? Se borrarán todos los datos.'))return;setBusy(true);var r=document.getElementById('sdResult');r.innerText='Formateando...';fetch('/formatsd').then(r=>r.json()).then(d=>{r.innerText=d.msg;}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;}).finally(()=>setBusy(false));}
+function downloadSD(name){window.location.href=name?('/downloadsd?file='+encodeURIComponent(name)):'/downloadsd';}
+function logNow(){if(busy)return;setBusy(true);var r=document.getElementById('sdResult');r.innerText='Leyendo sensores y guardando... (puede tardar unos segundos)';fetch('/lognow').then(r=>r.json()).then(d=>{r.innerText=d.msg;setBusy(false);loadDataTable();}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;setBusy(false);});}
+function loadSDFileList(){if(busy)return;setBusy(true);var w=document.getElementById('sdFileListWrap');w.innerHTML='<div class="ps" style="padding:8px">Cargando...</div>';fetch('/sdlist').then(r=>r.json()).then(d=>{if(!d.files||d.files.length==0){w.innerHTML='<div class="ps" style="padding:8px">Sin archivos en la SD.</div>';return;}var html='<table><thead><tr><th>Archivo</th><th>Tamaño</th><th></th></tr></thead><tbody>';d.files.forEach(function(f){var kb=(f.size/1024).toFixed(1);html+='<tr><td>'+f.name+'</td><td>'+kb+' KB</td><td><button type="button" class="btn br" style="padding:4px 10px" onclick="downloadSD(\''+f.name+'\')">&#x2B07;</button></td></tr>';});html+='</tbody></table>';w.innerHTML=html;}).catch(e=>{w.innerHTML='<div class="ps" style="padding:8px">Error de comunicación: '+e+'</div>';}).finally(()=>setBusy(false));}
 function loadDataTable(){var w=document.getElementById('dataTableWrap');w.innerHTML='<div class="ps" style="padding:8px">Cargando...</div>';fetch('/viewdata').then(r=>r.text()).then(t=>{var lines=t.split('\n').filter(l=>l.length>0);if(lines.length<2){w.innerHTML='<div class="ps" style="padding:8px">Sin datos registrados aún.</div>';return;}var head=lines[0].split(',');var html='<table><thead><tr>';head.forEach(h=>html+='<th>'+h+'</th>');html+='</tr></thead><tbody>';for(var i=lines.length-1;i>=1;i--){var cols=lines[i].split(',');html+='<tr>';cols.forEach(c=>html+='<td>'+c+'</td>');html+='</tr>';}html+='</tbody></table>';w.innerHTML=html;}).catch(e=>{w.innerHTML='<div class="ps" style="padding:8px">Error de comunicación: '+e+'</div>';});}
-function lteTest(){var r=document.getElementById('lteResult');r.innerText='Probando... (enciende el modem, puede tardar hasta 20 s)';fetch('/ltetest').then(r=>r.json()).then(d=>{var lines=[];if(d.modemInfo)lines.push('Modem: '+d.modemInfo);if(d.signal!=null)lines.push('Señal (CSQ): '+d.signal+(d.signal==99?' (desconocida)':''));if(d.simReady!=null)lines.push('SIM lista: '+(d.simReady?'sí':'no'));if(d.networkRegistered!=null)lines.push('Registrado en red: '+(d.networkRegistered?'sí':'no'));if(d.operator)lines.push('Operador: '+d.operator);if(d.gprsConnected!=null)lines.push('GPRS/Internet: '+(d.gprsConnected?'sí':'no'));if(d.ip)lines.push('IP: '+d.ip);lines.push(d.msg||(d.ok?'OK':'Error'));document.getElementById('lteResult').innerHTML=lines.join('<br>');}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;});}
+function lteTest(){if(busy)return;setBusy(true);var r=document.getElementById('lteResult');r.innerText='Probando... (enciende el modem, puede tardar hasta 20 s)';fetch('/ltetest').then(r=>r.json()).then(d=>{var lines=[];if(d.modemInfo)lines.push('Modem: '+d.modemInfo);if(d.signal!=null)lines.push('Señal (CSQ): '+d.signal+(d.signal==99?' (desconocida)':''));if(d.simReady!=null)lines.push('SIM lista: '+(d.simReady?'sí':'no'));if(d.networkRegistered!=null)lines.push('Registrado en red: '+(d.networkRegistered?'sí':'no'));if(d.operator)lines.push('Operador: '+d.operator);if(d.gprsConnected!=null)lines.push('GPRS/Internet: '+(d.gprsConnected?'sí':'no'));if(d.ip)lines.push('IP: '+d.ip);lines.push(d.msg||(d.ok?'OK':'Error'));document.getElementById('lteResult').innerHTML=lines.join('<br>');}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;}).finally(()=>setBusy(false));}
 document.querySelectorAll('form').forEach(f=>{f.onsubmit=function(e){if(this.querySelector('input[name="resetRain"]')&&!confirm('¿Reiniciar el contador de lluvia a 0? Esta acción no se puede deshacer.')){e.preventDefault();return;}if(!this.querySelector('input[name="reset"]')){e.preventDefault();fetch('/get?'+new URLSearchParams(new FormData(this))).then(()=>location.href='/').catch(()=>location.href='/');}}});
 </script>
 </body>
@@ -570,6 +589,9 @@ String processor(const String& var) {
   } else if (var == "LTE_SELECTED") {
     String connType = readFile(SPIFFS, "/connType.txt");
     return (connType == "LTE") ? "selected" : "";
+  } else if (var == "DATALOGER_SELECTED") {
+    String connType = readFile(SPIFFS, "/connType.txt");
+    return (connType == "DATALOGER") ? "selected" : "";
   } else if (var == "A_TH_CHECKED") {
     return readFile(SPIFFS, "/A_TH.txt") == "1" ? "checked" : "";
   } else if (var == "A_PR_CHECKED") {
@@ -683,6 +705,45 @@ bool formatSD() {
   slotCfg.gpio_cs = (gpio_num_t)SD_CS;
   slotCfg.host_id = (spi_host_device_t)host.slot;
 
+  // esp_vfs_fat_sdspi_mount() con format_if_mount_failed=true SOLO formatea
+  // cuando el montaje falla: si la tarjeta ya trae un FAT válido (el caso
+  // normal, viene formateada de fábrica o de un ciclo anterior), el mount
+  // simplemente reutiliza ese filesystem existente sin tocar nada — el botón
+  // reportaba "Formateo OK" sin borrar un solo byte. Para forzar un
+  // formateo real se inicializa la tarjeta a bajo nivel (sin pasar por
+  // FatFs) y se borran los primeros sectores (boot sector FAT / tabla de
+  // particiones): así el mount que sigue deja de encontrar un filesystem
+  // válido, dispara la rama "mount falló" y esp_vfs_fat_sdspi_mount hace un
+  // f_mkfs real.
+  {
+    sdspi_dev_handle_t wipeHandle;
+    esp_err_t wipeRet = sdspi_host_init();
+    if (wipeRet == ESP_OK || wipeRet == ESP_ERR_INVALID_STATE) {
+      wipeRet = sdspi_host_init_device(&slotCfg, &wipeHandle);
+    }
+    if (wipeRet == ESP_OK) {
+      sdmmc_host_t wipeHost = host;
+      wipeHost.slot = wipeHandle;
+      sdmmc_card_t rawCard;
+      wipeRet = sdmmc_card_init(&wipeHost, &rawCard);
+      if (wipeRet == ESP_OK) {
+        uint8_t zero[512] = {0};
+        for (int s = 0; s < 8 && wipeRet == ESP_OK; s++) {
+          wipeRet = sdmmc_write_sectors(&rawCard, zero, s, 1);
+        }
+        if (wipeRet != ESP_OK) {
+          Serial.printf("[SD] Advertencia: no se pudo borrar el sector de arranque: %s\n", esp_err_to_name(wipeRet));
+        }
+      } else {
+        Serial.printf("[SD] Advertencia: no se pudo inicializar la tarjeta para borrado: %s\n", esp_err_to_name(wipeRet));
+      }
+      sdspi_host_remove_device(wipeHandle);
+    } else {
+      Serial.printf("[SD] Advertencia: no se pudo iniciar el host SPI para borrado: %s\n", esp_err_to_name(wipeRet));
+    }
+    sdspi_host_deinit();
+  }
+
   esp_vfs_fat_sdmmc_mount_config_t mountCfg = {
     .format_if_mount_failed = true,
     .max_files = 2,
@@ -712,20 +773,46 @@ bool formatSD() {
 // Respaldo en la tarjeta microSD física, en formato CSV con marca de tiempo.
 // jsonLine es el mismo payload publicado por MQTT (ver readSensors()).
 void logToSD(const String &jsonLine) {
-  if (!sdReady) return;
+  if (!sdReady) {
+    Serial.println("[SD] Tarjeta no lista, se pierde este registro");
+    return;
+  }
 
   bool isNew = !SD.exists(SD_LOG_PATH);
   File f = SD.open(SD_LOG_PATH, FILE_APPEND);
+
+  // Si el open falla, la tarjeta puede haber quedado en un estado
+  // inconsistente (cableado marginal, ver initSD()) tras el ciclo anterior:
+  // se remonta una vez desde cero y se reintenta antes de darse por vencido,
+  // en vez de perder la lectura de este ciclo en silencio.
   if (!f) {
-    Serial.println("[SD] Error abriendo " SD_LOG_PATH);
-    return;
+    Serial.println("[SD] Error abriendo " SD_LOG_PATH ", remontando y reintentando...");
+    initSD();
+    if (!sdReady) {
+      Serial.println("[SD] Remontaje falló, se pierde este registro");
+      return;
+    }
+    isNew = !SD.exists(SD_LOG_PATH);
+    f = SD.open(SD_LOG_PATH, FILE_APPEND);
+    if (!f) {
+      Serial.println("[SD] Error abriendo " SD_LOG_PATH " tras reintento, se pierde este registro");
+      return;
+    }
   }
 
   if (isNew) {
     f.println("timestamp,epoch_s,mac,conn,T,H,WV,WD,RA,vB");
   }
 
-  StaticJsonDocument<256> doc;
+  // 256 se quedaba corto y descartaba el registro entero (DeserializationError
+  // NoMemory): a diferencia de DynamicJsonDocument docOut(384) en
+  // readSensors() (que solo tiene que ENSAMBLAR el JSON), este deserializeJson()
+  // parte de un String inmutable y por eso duplica en el pool tanto las claves
+  // como cada valor string (mac, timestamp ISO, "DATALOGER"/"error", etc.) —
+  // ese payload real ronda ~300 bytes con los 10 campos actuales. 512 deja
+  // margen para nombres de conexión o timestamps un poco más largos sin
+  // volver a quedarse sin memoria.
+  StaticJsonDocument<512> doc;
   DeserializationError err = deserializeJson(doc, jsonLine);
   if (err) {
     Serial.println("[SD] Error parseando JSON para CSV: " + String(err.c_str()));
@@ -745,8 +832,18 @@ void logToSD(const String &jsonLine) {
   row += ","; row += doc["RA"].as<String>();
   row += ","; row += doc["vB"].as<String>();
 
-  f.println(row);
+  // println() no reporta fallos de escritura de otra forma (disco lleno,
+  // tarjeta caída a media escritura): comparar los bytes devueltos contra el
+  // tamaño esperado de la fila es la única señal disponible de que el dato
+  // realmente quedó grabado.
+  size_t expected = row.length() + 1;  // +1 por el salto de línea de println()
+  size_t written = f.println(row);
   f.close();
+
+  if (written < expected) {
+    Serial.printf("[SD] ADVERTENCIA: escritura incompleta (%u/%u bytes) — tarjeta llena o con error, revisar espacio libre\n",
+                  (unsigned)written, (unsigned)expected);
+  }
 }
 
 /* ================ MARCA DE TIEMPO (hora real) ================ */
@@ -1035,6 +1132,15 @@ void setupServerRoutes() {
     StaticJsonDocument<384> doc;
     doc["ok"] = false;
 
+    // Este handler corre en el hilo "async_tcp" (el mismo que atiende TODAS
+    // las peticiones HTTP), que tiene su propio watchdog (~5 s por defecto).
+    // modem.waitForNetwork()/gprsConnect() bloquean muchos segundos sin
+    // devolver el control, así que sin esto el watchdog aborta y reinicia
+    // el equipo a medias (ver el mismo problema documentado en /lognow más
+    // abajo). Se desuscribe esta tarea del watchdog mientras dura el
+    // diagnóstico bloqueante y se vuelve a suscribir antes de responder.
+    esp_task_wdt_delete(NULL);
+
     modemPowerOn();
 
     if (!modem.init()) {
@@ -1043,6 +1149,7 @@ void setupServerRoutes() {
       if (!modem.init()) {
         doc["msg"] = "El modem SIM800 no responde";
         modemPowerOff();
+        esp_task_wdt_add(NULL);
         String response;
         serializeJson(doc, response);
         request->send(200, "application/json", response);
@@ -1062,6 +1169,7 @@ void setupServerRoutes() {
     if (!netOk) {
       doc["msg"] = "Sin registro en la red celular (revisar SIM/cobertura/antena)";
       modemPowerOff();
+      esp_task_wdt_add(NULL);
       String response;
       serializeJson(doc, response);
       request->send(200, "application/json", response);
@@ -1083,6 +1191,7 @@ void setupServerRoutes() {
     }
 
     modemPowerOff();
+    esp_task_wdt_add(NULL);
 
     String response;
     serializeJson(doc, response);
@@ -1090,9 +1199,46 @@ void setupServerRoutes() {
     Serial.println("[LTE TEST] Fin diagnóstico");
   });
 
+  // Captura manual bajo demanda (bloqueante, botón manual): lee sensores y
+  // agrega una fila a la SD tal cual lo haría un ciclo real de operación,
+  // sin esperar a que venza el período de sleep. En modo configuración
+  // init_running()/logToSD() nunca se ejecutan solos (el equipo no duerme
+  // mientras el portal AP está activo), así que sin este botón el archivo
+  // de la SD no gana filas nuevas mientras se está probando desde el portal.
+  server.on("/lognow", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("\n[LOG] Captura manual solicitada desde el portal AP");
+
+    // readSensors() bloquea 8-20+ s (2.5 s de arranque del sensor + hasta
+    // 10 s de reintentos del DHT + 3 s de muestreo de viento) corriendo
+    // SOBRE el hilo "async_tcp" (el mismo que atiende esta petición HTTP).
+    // Ese hilo tiene su propio watchdog (~5 s por defecto): sin esto el
+    // watchdog abortaba el firmware A MITAD de readSensors() (se veía en el
+    // log justo tras leer /ssidRainCounter.txt, el paso previo al de
+    // batería) — el equipo se reiniciaba antes de llegar siquiera a
+    // logToSD(), por eso datalog.csv nunca ganaba filas nuevas desde este
+    // botón. Se desuscribe esta tarea del watchdog mientras dura la
+    // captura y se vuelve a suscribir apenas termina.
+    esp_task_wdt_delete(NULL);
+    String sensorData = readSensors();
+    logToSD(sensorData);
+    esp_task_wdt_add(NULL);
+
+    StaticJsonDocument<256> doc;
+    doc["ok"] = sdReady;
+    doc["msg"] = sdReady ? "Lectura guardada en la SD" : "Tarjeta SD no disponible";
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
   // Formateo de SD bajo demanda (bloqueante, botón manual, destructivo).
   server.on("/formatsd", HTTP_GET, [](AsyncWebServerRequest *request) {
+    // Mismo problema de watchdog que /lognow y /ltetest: formatSD() (borrado
+    // de sectores + montaje/f_mkfs) corre en el hilo "async_tcp" que atiende
+    // esta petición.
+    esp_task_wdt_delete(NULL);
     bool ok = formatSD();
+    esp_task_wdt_add(NULL);
     StaticJsonDocument<256> doc;
     doc["ok"] = ok;
     doc["msg"] = ok ? "Formateo completado, tarjeta lista" : "Formateo falló (revisar cableado/tarjeta)";
@@ -1104,15 +1250,74 @@ void setupServerRoutes() {
     request->send(200, "application/json", response);
   });
 
-  // Descarga del respaldo en la tarjeta microSD física, en formato CSV.
+  // Lista los archivos en la raíz de la SD (nombre + tamaño) para que el
+  // portal pueda ofrecer un selector de descarga en vez de solo el CSV
+  // principal. No recursivo: esta firmware nunca crea subcarpetas en la SD.
+  server.on("/sdlist", HTTP_GET, [](AsyncWebServerRequest *request) {
+    DynamicJsonDocument doc(4096);
+    JsonArray files = doc.createNestedArray("files");
+
+    if (sdReady) {
+      File root = SD.open("/");
+      if (root && root.isDirectory()) {
+        File entry = root.openNextFile();
+        while (entry) {
+          if (!entry.isDirectory()) {
+            String name = String(entry.name());
+            if (name.startsWith("/")) name = name.substring(1);
+            JsonObject f = files.createNestedObject();
+            f["name"] = name;
+            f["size"] = (unsigned long)entry.size();
+          }
+          entry = root.openNextFile();
+        }
+        root.close();
+      }
+    }
+
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
+  // Descarga de un archivo de la tarjeta microSD física. Por compatibilidad,
+  // sin parámetro ?file= descarga el CSV principal (SD_LOG_PATH); con
+  // ?file=nombre descarga cualquier otro archivo listado por /sdlist.
+  // NOTA: usar request->send(fs,...,download=true) en vez de beginResponse()+
+  // addHeader("Content-Disposition",...) — ese patrón agregaba un SEGUNDO
+  // header Content-Disposition encima del "inline" que ya pone la librería
+  // cuando download=false, y los navegadores (Chrome:
+  // ERR_RESPONSE_HEADERS_MULTIPLE_CONTENT_DISPOSITION) rechazan la respuesta
+  // completa al ver dos headers Content-Disposition — por eso no descargaba
+  // nada. El archivo se sirve en streaming (chunked) directo desde la SD, así
+  // que el tamaño (varios MB) no es un problema.
   server.on("/downloadsd", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!sdReady || !SD.exists(SD_LOG_PATH)) {
-      request->send(404, "text/plain", "No hay datos disponibles en la SD");
+    String path = SD_LOG_PATH;
+
+    if (request->hasParam("file")) {
+      String reqName = request->getParam("file")->value();
+      // Solo nombres simples de archivo en la raíz: sin '/' interno ni '..',
+      // así no hay forma de escapar de la SD con un path arbitrario en el
+      // parámetro — esta firmware tampoco crea subcarpetas, así que una
+      // ruta con '/' nunca es un archivo legítimo de todos modos.
+      if (reqName.length() == 0 || reqName.indexOf('/') != -1 || reqName.indexOf("..") != -1) {
+        request->send(400, "text/plain", "Nombre de archivo inválido");
+        return;
+      }
+      path = "/" + reqName;
+    }
+
+    if (!sdReady || !SD.exists(path)) {
+      request->send(404, "text/plain", "Archivo no encontrado en la SD");
       return;
     }
-    AsyncWebServerResponse *response = request->beginResponse(SD, SD_LOG_PATH, "text/csv");
-    response->addHeader("Content-Disposition", "attachment; filename=datalog.csv");
-    request->send(response);
+
+    File f = SD.open(path, FILE_READ);
+    Serial.printf("[SD] Descargando %s (%lu bytes)\n", path.c_str(), (unsigned long)f.size());
+    f.close();
+
+    String contentType = path.endsWith(".csv") ? "text/csv" : "application/octet-stream";
+    request->send(SD, path, contentType, true);
   });
 
   // Últimas filas del respaldo en la SD en texto plano (CSV) para pintar una
@@ -2053,7 +2258,7 @@ bool sendDataWiFi(String jsonData) {
   }
 
   WiFi.mode(WIFI_STA);
-  WiFi.begin(RUNssid, RUNpass);
+  WiFi.begin(RUNssid.c_str(), RUNpass.c_str());
 
   int wifiRetries = 0;
   while (WiFi.status() != WL_CONNECTED && wifiRetries < 20) {
@@ -2173,24 +2378,33 @@ void init_running() {
 
     String sensorData = readSensors();
 
-    // Respaldo local en la SD, independientemente de si el envío MQTT funciona.
+    // Respaldo local en la SD, independientemente de si el envío MQTT funciona
+    // (o si no hay envío en absoluto, modo DATALOGER). Usa la hora ancla
+    // real-time cargada de /settime (ver logToSD()/getEpochNow()), no
+    // depende de tener red disponible en este ciclo.
     logToSD(sensorData);
 
-    bool success = false;
-
-    if (connectionType == "WIFI") {
-      Serial.println("[MODE] WiFi");
-      success = sendDataWiFi(sensorData);
-    } else if (connectionType == "LTE") {
-      Serial.println("[MODE] LTE");
-      success = sendDataLTE(sensorData);
-    }
-
-    if (success) {
-      Serial.println("[OK] Datos enviados correctamente");
+    if (connectionType == "DATALOGER") {
+      // Modo solo-registro local: no se enciende WiFi ni el modem, no hay
+      // nada que enviar ni encolar como pendiente — el dato ya quedó en la SD.
+      Serial.println("[MODE] Dataloger local (sin envío, solo respaldo en SD)");
     } else {
-      Serial.println("[ERROR] Fallo al enviar datos");
-      appendPendingRecord(sensorData);
+      bool success = false;
+
+      if (connectionType == "WIFI") {
+        Serial.println("[MODE] WiFi");
+        success = sendDataWiFi(sensorData);
+      } else if (connectionType == "LTE") {
+        Serial.println("[MODE] LTE");
+        success = sendDataLTE(sensorData);
+      }
+
+      if (success) {
+        Serial.println("[OK] Datos enviados correctamente");
+      } else {
+        Serial.println("[ERROR] Fallo al enviar datos");
+        appendPendingRecord(sensorData);
+      }
     }
 
     // Entrar en deep sleep
