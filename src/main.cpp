@@ -52,6 +52,29 @@ String dirSensorType = "MT6701";
 #define DHT_TYPE DHT21   // AM2301 = DHT21
 DHT dht(DHT_PIN, DHT_TYPE);
 
+/* ====================== STH30 SETTINGS ======================== */
+// Alternativa I2C al DHT22: comparte el mismo bus que el MT6701/AS5600
+// (SDA=21/SCL=22). tempSensorType ("DHT22"/"SHT30", persistido en
+// /tempSensor.txt) selecciona cuál se usa en tiempo de ejecución.
+#include "ClosedCube_SHT31D.h"
+ClosedCube_SHT31D sht3xd;
+#define SHT30_I2C_ADDRESS 0x44
+String tempSensorType = "DHT22";
+
+/* ====================== RS485 SETTINGS (RADIACIÓN) ======================== */
+// Sensor de radiación solar por RS485, conectado al mismo UART2 físico
+// (RX2=16/TX2=17) que usa el SIM800: solo es seguro leerlo en readSensors(),
+// ANTES de que sendDataLTE()/modemPowerOn() tomen esos pines para el modem.
+// Alimentación por MOSFET/relé en GPIO14, activo en ALTO (a diferencia de
+// los MOSFET canal P de sensores/modem, que son activos en BAJO).
+#define RS485_PWR_PIN 14
+#define RX_PIN 16
+#define TX_PIN 17
+#define BAUD_RATE 4800
+#define SERIAL_MODE SERIAL_8N1
+#define MAX_BUFFER 64
+uint8_t rs485Buffer[MAX_BUFFER];
+
 /* ====================== SD CARD SETTINGS (VSPI) ======================== */
 #include <SPI.h>
 #include <SD.h>
@@ -98,7 +121,7 @@ volatile bool serverReady = false;
 AsyncWebServer server(80);
 
 const char* ssid = "WeatherStation_config";
-const char* password = "12345678";
+const char* password = "1234567890";
 
 String RUNssid = "";
 String RUNpass = "";
@@ -164,6 +187,7 @@ uint64_t bootRtcSeconds = 0;
 boolean A_TH = false;
 boolean A_WS = false;
 boolean A_PR = false;
+boolean A_RAD = false;
 
 const char* PARAM_SSID = "ssidString";
 const char* PARAM_PASS = "passString";
@@ -231,6 +255,7 @@ struct {
   String temp = "--", hum  = "--";
   String rain = "--", wvel = "--", wdir = "--", bat = "--";
   String rainStatus = "--", rainCount = "--";
+  String rad = "--";
 } sensCache;
 
 /* ====================== HTML PAGE ======================== */
@@ -306,15 +331,17 @@ input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(1
 <div class="sb"><div class="sl">&#x2601; Estado Lluvia</div><div class="sv" id="rainStatus">--</div></div>
 <div class="sb"><div class="sl">&#x1F4A8; Vel. Viento</div><div class="sv" id="wvel">--</div></div>
 <div class="sb"><div class="sl">&#x1F9ED; Dir. Viento</div><div class="sv" id="wdir">--</div></div>
+<div class="sb"><div class="sl">&#x2600; Radiación</div><div class="sv" id="rad">--</div></div>
 </div>
 <div class="ps">Última actualización: <span id="upd">--</span> (cada 1 s, local)</div>
 </div>
 <div class="sc">
 <h3>&#x1F6E0; Sensores</h3>
 <form action="/get">
-<label><input type="checkbox" name="A_TH" value="1" %A_TH_CHECKED%>Temperatura y Humedad (DHT22)</label>
+<label><input type="checkbox" name="A_TH" value="1" %A_TH_CHECKED%>Temperatura y Humedad</label>
 <label><input type="checkbox" name="A_PR" value="1" %A_PR_CHECKED%>Precipitación</label>
 <label><input type="checkbox" name="A_WS" value="1" %A_WS_CHECKED%>Velocidad y Dirección del Viento</label>
+<label><input type="checkbox" name="A_RAD" value="1" %A_RAD_CHECKED%>Radiación Solar (RS485)</label>
 <input type="submit" value="Guardar Sensores">
 </form>
 <form action="/get">
@@ -322,6 +349,14 @@ input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(1
 <select name="dirSensor">
 <option value="MT6701" %MT6701_SELECTED%>MT6701 (encoder magnético)</option>
 <option value="AS5600" %AS5600_SELECTED%>AS5600 (brújula magnética)</option>
+</select>
+<input type="submit" value="Guardar Módulo">
+</form>
+<form action="/get">
+<label>Módulo de Temperatura/Humedad</label>
+<select name="tempSensor">
+<option value="DHT22" %DHT22_SELECTED%>DHT22/AM2301 (digital)</option>
+<option value="SHT30" %SHT30_SELECTED%>SHT30 (I2C)</option>
 </select>
 <input type="submit" value="Guardar Módulo">
 </form>
@@ -425,7 +460,7 @@ input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(1
 // mismo polling) terminan en "Failed to fetch" aunque el equipo siga vivo.
 var busy=false;
 function setBusy(b){busy=b;document.querySelectorAll('.heavy-btn').forEach(function(el){el.disabled=b;});}
-function u(){if(busy)return;fetch('/sensors').then(r=>r.json()).then(d=>{document.getElementById('temp').innerText=d.temp!='NA'?d.temp+'°C':'--';document.getElementById('hum').innerText=d.hum!='NA'?d.hum+'%%':'--';document.getElementById('rain').innerText=d.rain!='NA'?d.rain+' mm':'--';document.getElementById('rainStatus').innerText=d.rainStatus!='NA'?d.rainStatus:'--';document.getElementById('wvel').innerText=d.wvel!='NA'?d.wvel+' m/s':'--';document.getElementById('wdir').innerText=d.wdir!='NA'?d.wdir+'°':'--';document.getElementById('bat').innerText=d.bat||'--';var rc=document.getElementById('rainCounterVal');if(rc)rc.innerText=d.rainCount!='NA'?d.rainCount:'--';document.getElementById('upd').innerText=new Date().toLocaleTimeString();}).catch(e=>console.log(e));}
+function u(){if(busy)return;fetch('/sensors').then(r=>r.json()).then(d=>{document.getElementById('temp').innerText=d.temp!='NA'?d.temp+'°C':'--';document.getElementById('hum').innerText=d.hum!='NA'?d.hum+'%%':'--';document.getElementById('rain').innerText=d.rain!='NA'?d.rain+' mm':'--';document.getElementById('rainStatus').innerText=d.rainStatus!='NA'?d.rainStatus:'--';document.getElementById('wvel').innerText=d.wvel!='NA'?d.wvel+' m/s':'--';document.getElementById('wdir').innerText=d.wdir!='NA'?d.wdir+'°':'--';document.getElementById('rad').innerText=d.rad!='NA'?d.rad:'--';document.getElementById('bat').innerText=d.bat||'--';var rc=document.getElementById('rainCounterVal');if(rc)rc.innerText=d.rainCount!='NA'?d.rainCount:'--';document.getElementById('upd').innerText=new Date().toLocaleTimeString();}).catch(e=>console.log(e));}
 u();setInterval(u,1000);
 function syncTime(){fetch('/settime?epoch='+Math.floor(Date.now()/1000)).then(r=>r.json()).then(d=>{var tb=document.getElementById('timeBase');if(tb&&d.ok)tb.innerText=d.timestamp+' UTC (ancla)';}).catch(e=>console.log(e));}
 syncTime();
@@ -455,6 +490,12 @@ void setupServerRoutes();
 String vBat();
 void runRainCounter();
 void readDHT22(float &temperature, float &humidity, bool &success);
+void readSHT30(float &temperature, float &humidity, bool &success);
+void initSHT30();
+void initRS485();
+int radRS485();
+int readRS485Radiation();
+void deinitRS485();
 float WindDirection();
 float WindVelocity();
 void modemPowerOn();
@@ -598,6 +639,14 @@ String processor(const String& var) {
     return readFile(SPIFFS, "/A_PR.txt") == "1" ? "checked" : "";
   } else if (var == "A_WS_CHECKED") {
     return readFile(SPIFFS, "/A_WS.txt") == "1" ? "checked" : "";
+  } else if (var == "A_RAD_CHECKED") {
+    return readFile(SPIFFS, "/A_RAD.txt") == "1" ? "checked" : "";
+  } else if (var == "DHT22_SELECTED") {
+    String tempSensor = readFile(SPIFFS, "/tempSensor.txt");
+    return (tempSensor == "SHT30") ? "" : "selected";
+  } else if (var == "SHT30_SELECTED") {
+    String tempSensor = readFile(SPIFFS, "/tempSensor.txt");
+    return (tempSensor == "SHT30") ? "selected" : "";
   } else if (var == "MT6701_SELECTED") {
     String dirSensor = readFile(SPIFFS, "/dirSensor.txt");
     return (dirSensor == "AS5600") ? "" : "selected";
@@ -1048,6 +1097,12 @@ void deepSleepSystem() {
   digitalWrite(MODEM_PWR_PIN, HIGH);
   gpio_hold_en((gpio_num_t)MODEM_PWR_PIN);
 
+  // ===== APAGAR SENSOR DE RADIACIÓN (activo en ALTO, así que OFF=LOW) =====
+  gpio_hold_dis((gpio_num_t)RS485_PWR_PIN);
+  pinMode(RS485_PWR_PIN, OUTPUT);
+  digitalWrite(RS485_PWR_PIN, LOW);
+  gpio_hold_en((gpio_num_t)RS485_PWR_PIN);
+
   // ===== RX2/TX2 a LOW (no flotando): evita retroalimentar el SIM800 por
   // los pines UART mientras está sin alimentación. Incondicional: en modo
   // WiFi el modem nunca se enciende, así que sin esto estos pines
@@ -1114,6 +1169,7 @@ void setupServerRoutes() {
     doc["rainCount"] = sensCache.rainCount;
     doc["wvel"] = sensCache.wvel;
     doc["wdir"] = sensCache.wdir;
+    doc["rad"]  = sensCache.rad;
     doc["bat"]  = sensCache.bat;
     String response;
     serializeJson(doc, response);
@@ -1437,6 +1493,12 @@ void setupServerRoutes() {
       dirSensorType = val;
       Serial.println("[SAVE] dirSensor: " + val);
     }
+    else if (request->hasParam("tempSensor")) {
+      String val = request->getParam("tempSensor")->value();
+      writeFile(SPIFFS, "/tempSensor.txt", val.c_str());
+      tempSensorType = val;
+      Serial.println("[SAVE] tempSensor: " + val);
+    }
     else if (request->hasParam("period")) {
       String period = request->getParam("period")->value();
       writeFile(SPIFFS, "/timesleep.txt", period.c_str());
@@ -1458,6 +1520,7 @@ void setupServerRoutes() {
       writeFile(SPIFFS, "/A_TH.txt", request->hasParam("A_TH") ? "1" : "0");
       writeFile(SPIFFS, "/A_PR.txt", request->hasParam("A_PR") ? "1" : "0");
       writeFile(SPIFFS, "/A_WS.txt", request->hasParam("A_WS") ? "1" : "0");
+      writeFile(SPIFFS, "/A_RAD.txt", request->hasParam("A_RAD") ? "1" : "0");
       Serial.println("[SAVE] Configuración de sensores guardada");
     }
 
@@ -1700,6 +1763,260 @@ void readDHT22(float &temperature, float &humidity, bool &success) {
   success     = true;
 }
 
+/* ====================== READ SHT30 ======================== */
+// Alternativa I2C al DHT22 (mismo bus que el MT6701/AS5600, SDA=21/SCL=22).
+// Rango físico del SHT30 según datasheet, mismo criterio de descarte que
+// DHT22_TEMP_MIN/MAX arriba.
+#define SHT30_TEMP_MIN -40.0f
+#define SHT30_TEMP_MAX 125.0f
+#define SHT30_HUM_MIN 0.0f
+#define SHT30_HUM_MAX 100.0f
+
+void readSHT30(float &temperature, float &humidity, bool &success) {
+  success = false;
+  temperature = -999;
+  humidity = -999;
+
+  SHT31D result = sht3xd.readTempAndHumidity(SHT3XD_REPEATABILITY_LOW, SHT3XD_MODE_CLOCK_STRETCH, 50);
+
+  if (result.error != SHT3XD_NO_ERROR) {
+    Serial.printf("[SHT30] Error de lectura: %d\n", result.error);
+    return;
+  }
+
+  if (result.t < SHT30_TEMP_MIN || result.t > SHT30_TEMP_MAX ||
+      result.rh < SHT30_HUM_MIN || result.rh > SHT30_HUM_MAX) {
+    Serial.printf("[SHT30] Lectura fuera de rango, descartada (T=%.2f H=%.2f)\n", result.t, result.rh);
+    return;
+  }
+
+  temperature = result.t;
+  humidity    = result.rh;
+  success     = true;
+}
+
+/* ====================== READ LEVEL RS485 (RADIACIÓN) ======================== */
+// El sensor de radiación es esclavo Modbus RTU (dirección 0x01): no envía
+// nada por su cuenta, hay que interrogarlo con una trama de consulta
+// (function code 0x03, leer 4 registros desde 0x0000) y leer su respuesta.
+// Esto es lo que causaba "RAD":"error" siempre: la implementación anterior
+// solo escuchaba, sin escribir la consulta primero.
+// Enciende el sensor (GPIO14 en ALTO), abre Serial2 sobre RX2/TX2 (los
+// mismos pines físicos del SIM800, libres en este punto porque el modem
+// aún no se ha energizado — ver comentario junto a RS485_PWR_PIN).
+// Debe llamarse ANTES de sendDataLTE()/modemPowerOn() en el mismo ciclo.
+// El manual del CWT-SI especifica "Response time: <=10S": tras energizarlo
+// en frío, la medición óptica/ADC interna del sensor tarda hasta 10 s en
+// estabilizarse. Se confirmó que 10 s FIJOS de espera sí funcionan, pero en
+// la práctica el sensor suele estabilizarse antes — para un equipo a
+// batería con deep sleep, cada segundo despierto de más cuenta, así que en
+// vez de esperar siempre el máximo del datasheet, se sondea temprano y
+// seguido y se corta en cuanto la lectura deja de cambiar (ver
+// readRS485Radiation() más abajo). RS485_POWERUP_SETTLE_MS queda solo como
+// tope de seguridad por si el sensor nunca llega a estabilizarse.
+#define RS485_POWERUP_SETTLE_MS 10000
+// Cada cuánto se sondea mientras se espera que la lectura se estabilice.
+#define RS485_POLL_INTERVAL_MS 500
+// Nº de lecturas válidas consecutivas e iguales para darlas por estables.
+#define RS485_STABLE_READS 2
+
+// Activa el volcado detallado (bytes crudos TX/RX, detección de eco,
+// verificación de CRC) por el monitor serie. Ya diagnosticado y
+// confirmado funcionando — se deja en false por defecto para no gastar
+// tiempo de CPU/UART imprimiendo en cada ciclo normal; poner en true solo
+// si hace falta volver a depurar.
+#define RS485_DEBUG false
+
+void initRS485() {
+  pinMode(RS485_PWR_PIN, OUTPUT);
+  digitalWrite(RS485_PWR_PIN, HIGH);  // activo en ALTO
+
+  gpio_hold_dis((gpio_num_t)PIN_TX2);
+  gpio_hold_dis((gpio_num_t)PIN_RX2);
+
+  Serial2.begin(BAUD_RATE, SERIAL_MODE, RX_PIN, TX_PIN);
+}
+
+// CRC16 Modbus RTU estándar (polinomio 0xA001), usado para verificar que la
+// trama recibida no esté corrompida por ruido en el bus antes de confiar en
+// su contenido — clave para diferenciar "el sensor respondió basura" de
+// "hubo un error de cableado/timing y esto ni siquiera es una trama real".
+uint16_t modbusCRC16(const uint8_t *data, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int b = 0; b < 8; b++) {
+      if (crc & 0x0001) {
+        crc >>= 1;
+        crc ^= 0xA001;
+      } else {
+        crc >>= 1;
+      }
+    }
+  }
+  return crc;
+}
+
+void rs485HexDump(const char *label, const uint8_t *buf, int len) {
+  if (!RS485_DEBUG) return;
+  String hex;
+  for (int i = 0; i < len; i++) {
+    char b[4];
+    snprintf(b, sizeof(b), "%02X ", buf[i]);
+    hex += b;
+  }
+  Serial.printf("[RS485][DEBUG] %s (%d bytes): %s\n", label, len, hex.c_str());
+}
+
+int radRS485() {
+  while (Serial2.available()) Serial2.read();  // limpiar cualquier byte residual
+
+  // Consulta Modbus RTU documentada en el manual del sensor (CWT-SI):
+  // esclavo 0x01, function 0x03 (read holding registers), registro 0000H
+  // (irradiancia solar), 1 solo registro, CRC16 0x0A84.
+  uint8_t command[] = {0x01, 0x03, 0x00, 0x00, 0x00, 0x01, 0x84, 0x0A};
+  rs485HexDump("TX", command, sizeof(command));
+  Serial2.write(command, sizeof(command));
+  Serial2.flush();
+
+  int len = 0;
+  unsigned long start = millis();
+
+  // Ventana esperando la respuesta del sensor: a 4800 baudios una trama de
+  // 7 bytes tarda ~15 ms en el aire, 300 ms deja margen de sobra para el
+  // turnaround del esclavo sin desperdiciar tiempo despierto en cada sondeo.
+  while (millis() - start < 300 && len < MAX_BUFFER) {
+    if (Serial2.available()) {
+      rs485Buffer[len++] = Serial2.read();
+    }
+  }
+
+  rs485HexDump("RX crudo", rs485Buffer, len);
+
+  if (len == 0) {
+    Serial.println("[RS485] Sin respuesta del sensor de radiación (revisar cableado 485+/485- o alimentación 10-30V del sensor)");
+    return -1;
+  }
+
+  // Eco del propio bus: en RS485 de 2 hilos sin control de dirección por
+  // hardware, lo que el ESP32 transmite reaparece primero en la línea RX
+  // (es el mismo par de cables). Si los primeros bytes recibidos coinciden
+  // exactamente con la consulta enviada, hay que descartarlos y quedarse
+  // con lo que venga después — si no, se termina "leyendo" la propia
+  // consulta como si fuera la respuesta del sensor (esto es lo que
+  // probablemente está pasando: la consulta empieza con 01 03 00 00 00,
+  // y tomar los bytes 3-4 de ESO da 00 00 = 0, exactamente el síntoma
+  // reportado de "siempre lee 0" sin importar la luz que reciba el sensor).
+  uint8_t *frame = rs485Buffer;
+  int frameLen = len;
+  bool echoStripped = false;
+  if (len >= (int)sizeof(command) && memcmp(rs485Buffer, command, sizeof(command)) == 0) {
+    frame = rs485Buffer + sizeof(command);
+    frameLen = len - sizeof(command);
+    echoStripped = true;
+    Serial.println("[RS485] Eco de la consulta detectado y descartado");
+    rs485HexDump("RX tras quitar eco", frame, frameLen);
+  }
+
+  if (frameLen == 0) {
+    Serial.println(echoStripped
+      ? "[RS485] Solo se recibió el eco, el sensor no respondió (revisar 485+/485- o alimentación)"
+      : "[RS485] Sin datos utilizables");
+    return -1;
+  }
+
+  // Excepción Modbus: el esclavo devuelve function|0x80 + un código de error
+  // de 1 byte en vez de los datos pedidos (p.ej. dirección de registro
+  // inválida). Distinto de un fallo de comunicación: aquí SÍ hay diálogo,
+  // pero el sensor está rechazando la consulta.
+  if (frameLen >= 3 && (frame[1] & 0x80)) {
+    Serial.printf("[RS485] El sensor respondió una excepción Modbus: función=0x%02X código=0x%02X\n",
+                  frame[1], frame[2]);
+    return -1;
+  }
+
+  if (frameLen < 5 || frame[0] != 0x01 || frame[1] != 0x03) {
+    Serial.printf("[RS485] Respuesta inválida (%d bytes, addr=0x%02X func=0x%02X)\n",
+                  frameLen, frame[0], frame[1]);
+    return -1;
+  }
+
+  // Verificar CRC16 de la trama de respuesta: [addr][func][byteCount][data...][crcLo][crcHi]
+  int byteCount = frame[2];
+  int expectedFrameLen = 3 + byteCount + 2;
+  if (frameLen < expectedFrameLen) {
+    Serial.printf("[RS485] Trama incompleta (%d bytes, se esperaban %d)\n", frameLen, expectedFrameLen);
+    return -1;
+  }
+  uint16_t crcCalc = modbusCRC16(frame, 3 + byteCount);
+  uint16_t crcRecv = frame[3 + byteCount] | (frame[3 + byteCount + 1] << 8);
+  if (crcCalc != crcRecv) {
+    Serial.printf("[RS485] CRC inválido (calculado=0x%04X recibido=0x%04X) — trama corrupta por ruido en el bus\n",
+                  crcCalc, crcRecv);
+    return -1;
+  }
+
+  int value = (frame[3] << 8) | frame[4];
+  Serial.printf("[RS485] Radiación leída: %d W/m²\n", value);
+  return value;
+}
+
+// Sondea el sensor cada RS485_POLL_INTERVAL_MS y corta en cuanto obtiene
+// RS485_STABLE_READS lecturas válidas seguidas e IGUALES: eso es indicio de
+// que el sensor ya terminó su arranque en frío y está reportando su valor
+// real, en vez de esperar siempre el máximo de 10 s del datasheet. Si nunca
+// se estabiliza (o el bus falla), corta por seguridad a los
+// RS485_POWERUP_SETTLE_MS y devuelve la última lectura válida que haya
+// tenido (o -1 si nunca hubo ninguna).
+int readRS485Radiation() {
+  unsigned long t0 = millis();
+  int lastValue = -1;
+  int stableCount = 0;
+
+  while (millis() - t0 < RS485_POWERUP_SETTLE_MS) {
+    int value = radRS485();
+
+    if (value >= 0) {
+      if (value == lastValue) {
+        stableCount++;
+        if (stableCount >= RS485_STABLE_READS) {
+          Serial.printf("[RS485] Estable tras %lu ms: %d W/m²\n", millis() - t0, value);
+          return value;
+        }
+      } else {
+        stableCount = 1;
+        lastValue = value;
+      }
+    } else {
+      stableCount = 0;
+    }
+
+    delay(RS485_POLL_INTERVAL_MS);
+  }
+
+  if (lastValue >= 0) {
+    Serial.printf("[RS485] Tope de calentamiento (%d ms) sin estabilizar, se usa la última lectura válida: %d W/m²\n",
+                  RS485_POWERUP_SETTLE_MS, lastValue);
+  } else {
+    Serial.println("[RS485] Tope de calentamiento agotado sin ninguna lectura válida");
+  }
+  return lastValue;
+}
+
+void deinitRS485() {
+  Serial2.end();
+  digitalWrite(RS485_PWR_PIN, LOW);
+
+  gpio_hold_dis((gpio_num_t)PIN_TX2);
+  gpio_hold_dis((gpio_num_t)PIN_RX2);
+  pinMode(PIN_TX2, OUTPUT);
+  pinMode(PIN_RX2, OUTPUT);
+  digitalWrite(PIN_TX2, LOW);
+  digitalWrite(PIN_RX2, LOW);
+  gpio_hold_en((gpio_num_t)PIN_TX2);
+  gpio_hold_en((gpio_num_t)PIN_RX2);
+}
+
 /* ====================== WIND FUNCTIONS ======================== */
 // Contador de pulsos por interrupción, usado en modo config para calcular
 // la velocidad de forma continua (no bloqueante) en vez del muestreo de
@@ -1900,7 +2217,7 @@ void callback(char *topic, byte *payload, unsigned int length) {
   for (unsigned int i = 0; i < length; i++) msg_in += (char)payload[i];
   Serial.println("[CONFIG] Mensaje: " + msg_in);
 
-  StaticJsonDocument<256> docIn;
+  StaticJsonDocument<320> docIn;
   DeserializationError error = deserializeJson(docIn, msg_in);
   if (error) {
     Serial.printf("[CONFIG] JSON error: %s\n", error.c_str());
@@ -1912,17 +2229,21 @@ void callback(char *topic, byte *payload, unsigned int length) {
   if (docIn.containsKey("A_TH"))      A_TH          = docIn["A_TH"].as<bool>();
   if (docIn.containsKey("A_WS"))      A_WS          = docIn["A_WS"].as<bool>();
   if (docIn.containsKey("A_PR"))      A_PR          = docIn["A_PR"].as<bool>();
+  if (docIn.containsKey("A_RAD"))     A_RAD         = docIn["A_RAD"].as<bool>();
   if (docIn.containsKey("dirSensor")) dirSensorType = docIn["dirSensor"].as<String>() == "AS5600" ? "AS5600" : "MT6701";
+  if (docIn.containsKey("tempSensor")) tempSensorType = docIn["tempSensor"].as<String>() == "SHT30" ? "SHT30" : "DHT22";
 
   saveSetting(status ? "1" : "0",         "/status.txt");
   saveSetting(String((int)TIME_TO_SLEEP), "/timesleep.txt");
   saveSetting(A_TH ? "1" : "0",          "/A_TH.txt");
   saveSetting(A_WS ? "1" : "0",          "/A_WS.txt");
   saveSetting(A_PR ? "1" : "0",          "/A_PR.txt");
+  saveSetting(A_RAD ? "1" : "0",         "/A_RAD.txt");
   saveSetting(dirSensorType,             "/dirSensor.txt");
+  saveSetting(tempSensorType,            "/tempSensor.txt");
 
-  Serial.printf("[CONFIG] OK status=%d sleep=%llu seg (%llu min) TH=%d WS=%d PR=%d dirSensor=%s\n",
-                status, TIME_TO_SLEEP, TIME_TO_SLEEP / 60, A_TH, A_WS, A_PR, dirSensorType.c_str());
+  Serial.printf("[CONFIG] OK status=%d sleep=%llu seg (%llu min) TH=%d WS=%d PR=%d RAD=%d dirSensor=%s tempSensor=%s\n",
+                status, TIME_TO_SLEEP, TIME_TO_SLEEP / 60, A_TH, A_WS, A_PR, A_RAD, dirSensorType.c_str(), tempSensorType.c_str());
 
   configReceivedFlag = true;
 }
@@ -2034,28 +2355,43 @@ String readSensors() {
   digitalWrite(SENS_PWR_PIN, LOW);
   delay(2500);  // AM2301 necesita ≥2.5 s de arranque frío tras encender v_sensor
 
-  // Iniciar I2C una sola vez — solo lo usa el MT6701
-  if (A_WS) {
+  // Iniciar I2C una sola vez — lo usa el MT6701/AS5600 y, si está
+  // seleccionado, el SHT30 (comparten el mismo bus SDA=21/SCL=22)
+  bool needsI2C = A_WS || (A_TH && tempSensorType == "SHT30");
+  if (needsI2C) {
     Wire.begin(I2C_SDA, I2C_SCL);
     delay(50);
   }
 
-  // ===== TEMPERATURA Y HUMEDAD (DHT22) =====
+  // ===== TEMPERATURA Y HUMEDAD (DHT22 o SHT30) =====
   if (A_TH) {
-    Serial.println("[SENSOR] Leyendo DHT22...");
-    initDHT22();
-
     float temp, hum;
     bool ok;
     int retries = 0;
 
-    do {
-      readDHT22(temp, hum, ok);
-      if (!ok) {
-        retries++;
-        delay(2000);  // el DHT22 necesita ~2 s entre lecturas
-      }
-    } while (!ok && retries < 5);
+    if (tempSensorType == "SHT30") {
+      Serial.println("[SENSOR] Leyendo SHT30...");
+      initSHT30();
+
+      do {
+        readSHT30(temp, hum, ok);
+        if (!ok) {
+          retries++;
+          delay(500);
+        }
+      } while (!ok && retries < 5);
+    } else {
+      Serial.println("[SENSOR] Leyendo DHT22...");
+      initDHT22();
+
+      do {
+        readDHT22(temp, hum, ok);
+        if (!ok) {
+          retries++;
+          delay(2000);  // el DHT22 necesita ~2 s entre lecturas
+        }
+      } while (!ok && retries < 5);
+    }
 
     if (ok) {
       float tempCal = 0.5480f * temp + 9.0357f;
@@ -2066,7 +2402,7 @@ String readSensors() {
     } else {
       docOut["T"] = "error";
       docOut["H"] = "error";
-      Serial.println("[SENSOR] Error leyendo DHT22");
+      Serial.printf("[SENSOR] Error leyendo %s\n", tempSensorType.c_str());
     }
   }
 
@@ -2100,6 +2436,29 @@ String readSensors() {
     // No se resetea aquí: es un contador acumulado persistente, solo se
     // reinicia manualmente desde la vista de configuración (botón
     // "Reiniciar Contador de Lluvia" -> /get?resetRain=1).
+  }
+
+  // ===== RADIACIÓN SOLAR (RS485) =====
+  // El módulo RS485 TTL se alimenta de V_EXT, la MISMA rail que DHT/MT6701
+  // (MOSFET SENS_PWR_PIN): debe leerse ANTES de apagar esa rail, si no el
+  // módulo queda sin alimentación junto con los demás sensores. GPIO14 solo
+  // habilita el sensor de radiación en sí (activo en ALTO), no reemplaza
+  // la alimentación general. También debe leerse antes de que
+  // sendDataLTE()/modemPowerOn() tomen RX2/TX2 para el SIM800, ya que
+  // ambos comparten el mismo UART2 físico.
+  if (A_RAD) {
+    Serial.println("[SENSOR] Leyendo radiación (RS485)...");
+    initRS485();
+    int rad = readRS485Radiation();
+    deinitRS485();
+
+    if (rad >= 0) {
+      docOut["RAD"] = rad;
+      Serial.printf("[SENSOR] Radiación: %d\n", rad);
+    } else {
+      docOut["RAD"] = "error";
+      Serial.println("[SENSOR] Error leyendo radiación");
+    }
   }
 
   // Apagar sensores: MOSFET canal P gate HIGH = OFF
@@ -2421,12 +2780,16 @@ void readConfig() {
   String ath = readFile(SPIFFS, "/A_TH.txt");
   String aws = readFile(SPIFFS, "/A_WS.txt");
   String apr = readFile(SPIFFS, "/A_PR.txt");
+  String arad = readFile(SPIFFS, "/A_RAD.txt");
   String dirSensor = readFile(SPIFFS, "/dirSensor.txt");
+  String tempSensor = readFile(SPIFFS, "/tempSensor.txt");
 
   A_TH = (ath == "1");
   A_WS = (aws == "1");
   A_PR = (apr == "1");
+  A_RAD = (arad == "1");
   dirSensorType = (dirSensor == "AS5600") ? "AS5600" : "MT6701";
+  tempSensorType = (tempSensor == "SHT30") ? "SHT30" : "DHT22";
 
   String apnCfg = readFile(SPIFFS, "/apn.txt");
   RUNapn = (apnCfg == "") ? "claro.pe" : apnCfg;
@@ -2435,7 +2798,9 @@ void readConfig() {
   Serial.printf("A_TH = %s\n", A_TH ? "true" : "false");
   Serial.printf("A_WS = %s\n", A_WS ? "true" : "false");
   Serial.printf("A_PR = %s\n", A_PR ? "true" : "false");
+  Serial.printf("A_RAD = %s\n", A_RAD ? "true" : "false");
   Serial.printf("dirSensorType = %s\n", dirSensorType.c_str());
+  Serial.printf("tempSensorType = %s\n", tempSensorType.c_str());
   Serial.printf("RUNapn = %s\n\n", RUNapn.c_str());
 }
 
@@ -2450,6 +2815,13 @@ void initDHT22() {
   dht.readTemperature();
   dht.readHumidity();
   delay(2000);
+}
+
+void initSHT30() {
+  Wire.begin(I2C_SDA, I2C_SCL);
+  delay(50);
+  sht3xd.begin(SHT30_I2C_ADDRESS);
+  delay(50);
 }
 
 void initMT6701() {
@@ -2496,8 +2868,19 @@ void updateSensCache() {
     }
 
     if (A_TH) {
-      initDHT22();
+      if (tempSensorType == "SHT30") {
+        initSHT30();
+      } else {
+        initDHT22();
+      }
       lastDHTRead = millis() - 2000;  // permitir una lectura inmediata
+    }
+
+    if (A_RAD) {
+      // Se abre una sola vez y se deja activo mientras dure el modo config:
+      // en modo config el modem SIM800 nunca se usa (solo WiFi AP), así
+      // que RX2/TX2 quedan libres para el sensor de radiación.
+      initRS485();
     }
 
     if (A_PR) {
@@ -2513,11 +2896,15 @@ void updateSensCache() {
     sensorsInitialized = true;
   }
 
-  // DHT22: el sensor solo admite una lectura válida cada ~2 s
+  // Temp/Hum (DHT22 o SHT30): el sensor solo admite una lectura válida cada ~2 s
   if (A_TH) {
     if (millis() - lastDHTRead >= 2000) {
       float t, h; bool ok;
-      readDHT22(t, h, ok);
+      if (tempSensorType == "SHT30") {
+        readSHT30(t, h, ok);
+      } else {
+        readDHT22(t, h, ok);
+      }
       if (ok) {
         sensCache.temp = String(t, 1);
         sensCache.hum  = String(h, 1);
@@ -2613,6 +3000,22 @@ void updateSensCache() {
     sensCache.rainCount = "NA";
   }
 
+  // Radiación (RS485): trama lenta, se sondea cada 15 s (no en cada vuelta
+  // de loop()) para no bloquear el resto del refresco de la cache tan seguido.
+  static unsigned long lastRadRead = 0;
+  if (A_RAD) {
+    if (millis() - lastRadRead >= 15000) {
+      // El módulo ya lleva rato energizado (se abrió una sola vez arriba),
+      // así que aquí no hace falta la espera de calentamiento: una consulta
+      // directa basta.
+      int rad = radRS485();
+      sensCache.rad = (rad >= 0) ? String(rad) : "error";
+      lastRadRead = millis();
+    }
+  } else {
+    sensCache.rad = "NA";
+  }
+
   sensCache.bat = vBat();
 }
 
@@ -2629,7 +3032,9 @@ void createDefaultConfigs() {
     {"/A_TH.txt", "0"},
     {"/A_WS.txt", "0"},
     {"/A_PR.txt", "0"},
+    {"/A_RAD.txt", "0"},
     {"/dirSensor.txt", "MT6701"},
+    {"/tempSensor.txt", "DHT22"},
     {"/connType.txt", "WIFI"},
     {"/apn.txt", "claro.pe"},
     {"/timesleep.txt", "300"},
@@ -2670,6 +3075,7 @@ void setup() {
   gpio_deep_sleep_hold_dis();
   gpio_hold_dis((gpio_num_t)MODEM_PWR_PIN);
   gpio_hold_dis((gpio_num_t)SENS_PWR_PIN);
+  gpio_hold_dis((gpio_num_t)RS485_PWR_PIN);
   gpio_hold_dis((gpio_num_t)PIN_TX2);
   gpio_hold_dis((gpio_num_t)PIN_RX2);
 
@@ -2681,6 +3087,11 @@ void setup() {
 
   pinMode(SENS_PWR_PIN, OUTPUT);
   digitalWrite(SENS_PWR_PIN, HIGH);
+
+  // Sensor de radiación RS485: activo en ALTO (a diferencia de los MOSFET
+  // canal P de arriba), así que "apagado" por defecto es un LOW simple.
+  pinMode(RS485_PWR_PIN, OUTPUT);
+  digitalWrite(RS485_PWR_PIN, LOW);
 
   // RX2/TX2 a LOW por defecto hasta que modemPowerOn() los reconfigure
   // como UART: evita retroalimentar el SIM800 (ver modemLinesOff()).
