@@ -14,6 +14,9 @@
  *   Lluvia   : GPIO39 (entrada solo, sin pull interno) - wakeup por EXT1
  *   Viento   : GPIO13/D13 (velocidad por pulsos), MT6701 o AS5600 por I2C (SDA=21/SCL=22)
  *              para dirección — se elige por software (dirSensorType, /dirSensor.txt)
+ *   RTC      : DS3231 por I2C (mismo bus, SDA=21/SCL=22, dirección fija 0x68) —
+ *              da la marca de tiempo real; mantiene la hora con su propia batería
+ *              de respaldo aunque el equipo pierda alimentación por completo.
  *   DHT      : GPIO4 (DHT22)
  *   Batería  : GPIO34 (ADC), divisor 100k/100k.  
  *   Botón AP : GPIO36 (modo configuración si está en LOW al arrancar).
@@ -45,6 +48,18 @@
 MT6701 encoder;
 AS5600 as5600;
 String dirSensorType = "MT6701";
+
+/* ====================== RTC DS3231 (marca de tiempo real) ======================== */
+// Comparte el bus I2C con el encoder de dirección de viento (SDA=21/SCL=22,
+// dirección I2C fija 0x68). A diferencia del esquema de "ancla" por software
+// de más abajo (que depende de que algún dispositivo haya cargado /settime o
+// de haber tenido red alguna vez), el DS3231 mantiene la hora real por sí
+// mismo gracias a su batería de respaldo, incluso si el equipo pierde
+// alimentación por completo. getEpochNow() lo usa como fuente primaria y
+// solo cae al esquema de ancla por software si el DS3231 no responde.
+#include <RTClib.h>
+RTC_DS3231 ds3231;
+bool ds3231Ready = false;
 
 /* ====================== DHT22 TEMP/HUM SETTINGS ======================== */
 #include <DHT.h>
@@ -470,6 +485,7 @@ void init_running();
 void readConfig();
 void initDHT22();
 void initMT6701();
+void initDS3231();
 void initSD();
 bool formatSD();
 void logToSD(const String &line);
@@ -860,6 +876,9 @@ void loadTimeBase() {
 
 // Ancla la hora real contra el RTC interno. Se llama desde /settime, con el
 // epoch (segundos Unix, UTC) que envía el navegador/teléfono conectado al AP.
+// También reajusta el DS3231 si está disponible, para que el reloj con
+// batería de respaldo se mantenga alineado con la fuente de hora más
+// reciente (NTP, hora de red LTE o el navegador conectado al AP).
 void setTimeBase(uint64_t epochSeconds) {
   timeBaseEpoch = epochSeconds;
   timeBaseRtc = getRtcTimeSeconds();
@@ -867,12 +886,42 @@ void setTimeBase(uint64_t epochSeconds) {
   writeFile(SPIFFS, "/timeBaseEpoch.txt", String((unsigned long)timeBaseEpoch).c_str());
   writeFile(SPIFFS, "/timeBaseRtc.txt", String((unsigned long)timeBaseRtc).c_str());
   Serial.printf("[TIME] Ancla actualizada: epoch=%llu rtc=%llu\n", timeBaseEpoch, timeBaseRtc);
+
+  if (ds3231Ready) {
+    ds3231.adjust(DateTime((uint32_t)epochSeconds));
+    Serial.println("[RTC] DS3231 realineado con la nueva ancla de hora");
+  }
 }
 
-// Hora real estimada "ahora mismo": ancla + segundos de RTC transcurridos
-// desde que se guardó. Si nunca se estableció el ancla, devuelve 0 (el
-// llamador debe usar formatTimestamp/logToSD con ese caso en mente).
+// Inicializa el DS3231 sobre el bus I2C (ya debe estar en marcha —
+// Wire.begin()) y, únicamente si perdió la hora (batería de respaldo nueva,
+// agotada o ausente la primera vez que se energiza), la ajusta a la hora de
+// compilación del firmware — es decir, la hora del PC donde se compiló/subió
+// el sketch en ese momento. Al quedar la hora guardada y con batería,
+// lostPower() da false en todos los arranques siguientes, así que este
+// ajuste ocurre una única vez por batería del DS3231, no en cada boot.
+void initDS3231() {
+  ds3231Ready = ds3231.begin();
+  if (!ds3231Ready) {
+    Serial.println("[RTC] DS3231 no detectado en el bus I2C");
+    return;
+  }
+  if (ds3231.lostPower()) {
+    Serial.println("[RTC] DS3231 sin hora valida — ajustando (una sola vez) a la hora del PC de compilacion");
+    ds3231.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+  Serial.printf("[RTC] DS3231 listo, hora actual: %s\n", ds3231.now().timestamp().c_str());
+}
+
+// Hora real "ahora mismo". Fuente primaria: el DS3231 (hardware, con batería
+// de respaldo). Si no responde, cae al esquema de ancla por software (ancla +
+// segundos de RTC-slow-clock transcurridos desde que se guardó). Si tampoco
+// hay ancla, devuelve 0 (el llamador debe usar formatTimestamp/logToSD con
+// ese caso en mente).
 uint64_t getEpochNow() {
+  if (ds3231Ready) {
+    return ds3231.now().unixtime();
+  }
   if (!timeBaseSet) return 0;
   uint64_t nowRtc = getRtcTimeSeconds();
   uint64_t elapsed = (nowRtc > timeBaseRtc) ? (nowRtc - timeBaseRtc) : 0;
@@ -2023,22 +2072,22 @@ void wakeup_reason() {
 String readSensors() {
   Serial.println("\n[SENSORS] Iniciando lectura de sensores...");
 
-  DynamicJsonDocument docOut(384);
-  docOut["type"] = "weatherStationData";
-  docOut["mac"] = macA();
-  docOut["conn"] = connectionType;
-  docOut["timestamp"] = formatTimestampISO8601(getEpochNow());
-
   // Encender sensores: MOSFET canal P gate LOW = ON
   pinMode(SENS_PWR_PIN, OUTPUT);
   digitalWrite(SENS_PWR_PIN, LOW);
   delay(2500);  // AM2301 necesita ≥2.5 s de arranque frío tras encender v_sensor
 
-  // Iniciar I2C una sola vez — solo lo usa el MT6701
-  if (A_WS) {
-    Wire.begin(I2C_SDA, I2C_SCL);
-    delay(50);
-  }
+  // Iniciar I2C una sola vez — lo usan el MT6701/AS5600 (si A_WS) y siempre
+  // el DS3231 (marca de tiempo), así que ya no se condiciona a A_WS.
+  Wire.begin(I2C_SDA, I2C_SCL);
+  delay(50);
+  initDS3231();
+
+  DynamicJsonDocument docOut(384);
+  docOut["type"] = "weatherStationData";
+  docOut["mac"] = macA();
+  docOut["conn"] = connectionType;
+  docOut["timestamp"] = formatTimestampISO8601(getEpochNow());
 
   // ===== TEMPERATURA Y HUMEDAD (DHT22) =====
   if (A_TH) {
@@ -2485,9 +2534,13 @@ void updateSensCache() {
     digitalWrite(SENS_PWR_PIN, LOW);
     delay(2500);  // AM2301 necesita ≥2.5 s de arranque frío tras encender v_sensor
 
+    // Iniciar I2C una sola vez — lo usan el MT6701/AS5600 (si A_WS) y siempre
+    // el DS3231 (marca de tiempo), así que ya no se condiciona a A_WS.
+    Wire.begin(I2C_SDA, I2C_SCL);
+    delay(50);
+    initDS3231();
+
     if (A_WS) {
-      Wire.begin(I2C_SDA, I2C_SCL);
-      delay(50);
       initMT6701();
 
       pinMode(pinWindVelocity, INPUT_PULLUP);
