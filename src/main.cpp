@@ -893,22 +893,44 @@ void setTimeBase(uint64_t epochSeconds) {
   }
 }
 
+// Compensación fija (segundos) por el tiempo que transcurre entre que el
+// compilador congela __DATE__/__TIME__ y el instante real en que el DS3231
+// queda energizado y ejecuta este ajuste (compilar + enlazar + subir por
+// USB + arranque del ESP32). Sin esto el DS3231 arranca sistemáticamente
+// atrasado respecto al reloj del PC en ese margen — se sumó tras observar
+// ~5 min de atraso en una subida real. Ajustar si el flujo de compilar/subir
+// cambia mucho de duración en este equipo.
+#define DS3231_BUILD_UPLOAD_LAG_SEC 300
+
 // Inicializa el DS3231 sobre el bus I2C (ya debe estar en marcha —
-// Wire.begin()) y, únicamente si perdió la hora (batería de respaldo nueva,
-// agotada o ausente la primera vez que se energiza), la ajusta a la hora de
-// compilación del firmware — es decir, la hora del PC donde se compiló/subió
-// el sketch en ese momento. Al quedar la hora guardada y con batería,
-// lostPower() da false en todos los arranques siguientes, así que este
-// ajuste ocurre una única vez por batería del DS3231, no en cada boot.
+// Wire.begin()). La ajusta a la hora de compilación del firmware (más el
+// margen de DS3231_BUILD_UPLOAD_LAG_SEC) — es decir, la hora del PC donde se
+// compiló/subió el sketch — en dos casos:
+//   1) Perdió la hora (batería de respaldo nueva, agotada o ausente): se
+//      ajusta en cada boot mientras eso siga así.
+//   2) Es la primera vez que arranca ESTE binario (marcador en SPIFFS
+//      ausente): fuerza un resync una única vez por firmware subido, aunque
+//      el DS3231 ya tuviera hora válida de una batería previa — así una
+//      subida nueva siempre corrige el reloj a la hora actual del PC en vez
+//      de arrastrar la hora que se le haya puesto antes.
+// Fuera de esos dos casos no se vuelve a tocar: el DS3231 sigue su marcha
+// con su propio oscilador/batería hasta la próxima subida o pérdida de hora.
 void initDS3231() {
   ds3231Ready = ds3231.begin();
   if (!ds3231Ready) {
     Serial.println("[RTC] DS3231 no detectado en el bus I2C");
     return;
   }
-  if (ds3231.lostPower()) {
-    Serial.println("[RTC] DS3231 sin hora valida — ajustando (una sola vez) a la hora del PC de compilacion");
-    ds3231.adjust(DateTime(F(__DATE__), F(__TIME__)));
+
+  bool firstBootOfThisBinary = !SPIFFS.exists("/ds3231Synced.txt");
+  if (ds3231.lostPower() || firstBootOfThisBinary) {
+    DateTime compileTime(F(__DATE__), F(__TIME__));
+    DateTime corrected(compileTime.unixtime() + DS3231_BUILD_UPLOAD_LAG_SEC);
+    Serial.printf("[RTC] Ajustando DS3231 a la hora del PC (compilacion+%ds): %s (motivo: %s)\n",
+                  DS3231_BUILD_UPLOAD_LAG_SEC, corrected.timestamp().c_str(),
+                  ds3231.lostPower() ? "sin hora valida" : "primer arranque de este firmware");
+    ds3231.adjust(corrected);
+    writeFile(SPIFFS, "/ds3231Synced.txt", "1");
   }
   Serial.printf("[RTC] DS3231 listo, hora actual: %s\n", ds3231.now().timestamp().c_str());
 }
