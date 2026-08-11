@@ -380,14 +380,19 @@ input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(1
 </div>
 <div class="tb" style="margin-top:8px">
 <button type="button" class="btn br heavy-btn" onclick="loadSDFileList()">&#x1F4C2; Ver Archivos SD</button>
-<button type="button" class="btn be heavy-btn" onclick="formatSD()">&#x1F5D1; Formatear Tarjeta</button>
+<button type="button" class="btn be heavy-btn" onclick="deleteLogFile()">&#x1F5D1; Borrar Archivo de Datos</button>
 </div>
-<div id="sdResult" class="ps">"Guardar Lectura Ahora" agrega una fila real a la SD sin esperar el ciclo de sleep — útil para probar mientras se está en el portal. Formatear borra todos los datos de la tarjeta.</div>
+<div class="tb" style="margin-top:8px">
+<button type="button" class="btn be heavy-btn" onclick="formatSD()">&#x1F5D1; Formatear Tarjeta (completo)</button>
+</div>
+<div id="sdResult" class="ps">"Guardar Lectura Ahora" agrega una fila real a la SD sin esperar el ciclo de sleep — útil para probar mientras se está en el portal. "Borrar Archivo de Datos" solo borra datalog.csv. "Formatear Tarjeta" borra TODO el contenido de la tarjeta (usar solo si la tarjeta quedó corrupta).</div>
 <div class="dt" id="sdFileListWrap" style="margin-top:8px"></div>
 </div>
 
 <div class="sc">
 <div class="ps">&#x1F551; Hora de referencia: <span id="timeBase">%TIME_BASE%</span></div>
+<button type="button" class="btn br heavy-btn" style="width:100%%;margin-top:8px" onclick="syncTime(true)">&#x1F553; Actualizar Reloj RTC (DS3231)</button>
+<div id="rtcResult" class="ps">Sincroniza la hora ancla y el RTC DS3231 con el reloj de este PC/celular. También se hace automáticamente al cargar esta página.</div>
 </div>
 
 <div class="sc">
@@ -442,9 +447,10 @@ var busy=false;
 function setBusy(b){busy=b;document.querySelectorAll('.heavy-btn').forEach(function(el){el.disabled=b;});}
 function u(){if(busy)return;fetch('/sensors').then(r=>r.json()).then(d=>{document.getElementById('temp').innerText=d.temp!='NA'?d.temp+'°C':'--';document.getElementById('hum').innerText=d.hum!='NA'?d.hum+'%%':'--';document.getElementById('rain').innerText=d.rain!='NA'?d.rain+' mm':'--';document.getElementById('rainStatus').innerText=d.rainStatus!='NA'?d.rainStatus:'--';document.getElementById('wvel').innerText=d.wvel!='NA'?d.wvel+' m/s':'--';document.getElementById('wdir').innerText=d.wdir!='NA'?d.wdir+'°':'--';document.getElementById('bat').innerText=d.bat||'--';var rc=document.getElementById('rainCounterVal');if(rc)rc.innerText=d.rainCount!='NA'?d.rainCount:'--';document.getElementById('upd').innerText=new Date().toLocaleTimeString();}).catch(e=>console.log(e));}
 u();setInterval(u,1000);
-function syncTime(){fetch('/settime?epoch='+Math.floor(Date.now()/1000)).then(r=>r.json()).then(d=>{var tb=document.getElementById('timeBase');if(tb&&d.ok)tb.innerText=d.timestamp+' UTC (ancla)';}).catch(e=>console.log(e));}
-syncTime();
-function formatSD(){if(busy)return;if(!confirm('¿Formatear la tarjeta SD? Se borrarán todos los datos.'))return;setBusy(true);var r=document.getElementById('sdResult');r.innerText='Formateando...';fetch('/formatsd').then(r=>r.json()).then(d=>{r.innerText=d.msg;}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;}).finally(()=>setBusy(false));}
+function syncTime(manual){if(manual){if(busy)return;setBusy(true);}var rr=document.getElementById('rtcResult');if(manual&&rr)rr.innerText='Sincronizando...';fetch('/settime?epoch='+Math.floor(Date.now()/1000)).then(r=>r.json()).then(d=>{var tb=document.getElementById('timeBase');if(tb&&d.ok)tb.innerText=d.timestamp+' UTC (ancla)';if(rr){if(!d.ok)rr.innerText='Error: '+(d.msg||'desconocido');else rr.innerText=(d.ds3231?'RTC DS3231 actualizado a '+d.timestamp+' UTC.':'Ancla de hora actualizada, pero el DS3231 no respondió (revisar cableado I2C).');}}).catch(e=>{if(rr)rr.innerText='Error de comunicación con el dispositivo: '+e;}).finally(()=>{if(manual)setBusy(false);});}
+syncTime(false);
+function formatSD(){if(busy)return;if(!confirm('¿Formatear TODA la tarjeta SD? Se borrarán todos los datos y archivos.'))return;setBusy(true);var r=document.getElementById('sdResult');r.innerText='Formateando...';fetch('/formatsd').then(r=>r.json()).then(d=>{r.innerText=d.msg;}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;}).finally(()=>setBusy(false));}
+function deleteLogFile(){if(busy)return;if(!confirm('¿Borrar el archivo de datos (datalog.csv)? Se perderán los registros guardados.'))return;setBusy(true);var r=document.getElementById('sdResult');r.innerText='Borrando...';fetch('/deletelog').then(r=>r.json()).then(d=>{r.innerText=d.msg;loadDataTable();}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;}).finally(()=>setBusy(false));}
 function downloadSD(name){window.location.href=name?('/downloadsd?file='+encodeURIComponent(name)):'/downloadsd';}
 function logNow(){if(busy)return;setBusy(true);var r=document.getElementById('sdResult');r.innerText='Leyendo sensores y guardando... (puede tardar unos segundos)';fetch('/lognow').then(r=>r.json()).then(d=>{r.innerText=d.msg;setBusy(false);loadDataTable();}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;setBusy(false);});}
 function loadSDFileList(){if(busy)return;setBusy(true);var w=document.getElementById('sdFileListWrap');w.innerHTML='<div class="ps" style="padding:8px">Cargando...</div>';fetch('/sdlist').then(r=>r.json()).then(d=>{if(!d.files||d.files.length==0){w.innerHTML='<div class="ps" style="padding:8px">Sin archivos en la SD.</div>';return;}var html='<table><thead><tr><th>Archivo</th><th>Tamaño</th><th></th></tr></thead><tbody>';d.files.forEach(function(f){var kb=(f.size/1024).toFixed(1);html+='<tr><td>'+f.name+'</td><td>'+kb+' KB</td><td><button type="button" class="btn br" style="padding:4px 10px" onclick="downloadSD(\''+f.name+'\')">&#x2B07;</button></td></tr>';});html+='</tbody></table>';w.innerHTML=html;}).catch(e=>{w.innerHTML='<div class="ps" style="padding:8px">Error de comunicación: '+e+'</div>';}).finally(()=>setBusy(false));}
@@ -579,6 +585,33 @@ String macA() {
   char macStr[18];
   sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   return String(macStr);
+}
+
+/* ====================== CALIBRACIÓN POR DISPOSITIVO (MAC) ======================== */
+// Coeficientes de calibración (Oficial = slope·lectura_cruda + offset) para T/H/viento,
+// usados en readSensors(). Dos equipos concretos ("Sotomayor 1"/"Sotomayor 2") fueron
+// calibrados cada uno contra su propia referencia oficial en su ubicación, así que sus
+// coeficientes reemplazan (no se suman a) los genéricos por defecto. Cualquier otro MAC
+// no listado aquí sigue usando los coeficientes genéricos (comportamiento previo, sin
+// calibración por equipo).
+struct CalCoeffs {
+  float tempSlope, tempOffset;
+  float humSlope, humOffset;
+  float windSlope, windOffset;
+};
+
+CalCoeffs getCalCoeffs() {
+  String mac = macA();
+
+  if (mac == "30:76:F5:F7:6E:7C") {  // Sotomayor 1
+    return CalCoeffs{ 0.582f, 8.020f, 0.588f, 31.972f, 1.585f, 0.539f };
+  }
+  if (mac == "30:76:F5:F8:E5:E8") {  // Sotomayor 2
+    return CalCoeffs{ 0.90f, 1.63f, 1.09f, -20.37f, 2.38f, -0.62f };
+  }
+
+  // Genéricos por defecto (comportamiento previo, sin cambios)
+  return CalCoeffs{ 0.5480f, 9.0357f, 0.4499f, 54.7577f, 0.6448f, 0.5343f };
 }
 
 String processor(const String& var) {
@@ -924,14 +957,44 @@ void initDS3231() {
   Serial.printf("[RTC] DS3231 listo, hora actual: %s\n", ds3231.now().timestamp().c_str());
 }
 
+// Ventana de fechas plausible para aceptar la lectura del DS3231: no antes de
+// que este firmware se haya compilado (con un pequeño margen, por si el reloj
+// del equipo aún no se ajustó justo tras flashear) ni más de MAX_YEARS_AHEAD
+// después. Visto en campo: el DS3231 a veces devuelve una fecha disparatada
+// (epoch de ~2043 en una lectura y ~2028 en la siguiente, sin relación con la
+// hora real) por una lectura I2C corrupta o la batería de respaldo fallando.
+// Igual que se descartan lecturas de DHT22/viento fuera de su rango físico
+// (ver DHT22_TEMP_MIN/MAX, MAX_WIND_SPEED_MS), una fecha implausible del
+// DS3231 se descarta en vez de propagarse al log, y se cae al ancla por
+// software en su lugar.
+bool isPlausibleEpoch(uint64_t epochSeconds) {
+  static uint64_t compileEpoch = 0;
+  if (compileEpoch == 0) {
+    DateTime compileTime(F(__DATE__), F(__TIME__));
+    compileEpoch = compileTime.unixtime();
+  }
+  const uint64_t SLACK_BEFORE_S     = 24ULL * 3600;          // 1 día de margen hacia atrás
+  const uint64_t MAX_YEARS_AHEAD_S  = 10ULL * 365 * 24 * 3600;  // 10 años hacia adelante
+
+  uint64_t lowerBound = (compileEpoch > SLACK_BEFORE_S) ? (compileEpoch - SLACK_BEFORE_S) : 0;
+  uint64_t upperBound = compileEpoch + MAX_YEARS_AHEAD_S;
+  return epochSeconds >= lowerBound && epochSeconds <= upperBound;
+}
+
 // Hora real "ahora mismo". Fuente primaria: el DS3231 (hardware, con batería
-// de respaldo). Si no responde, cae al esquema de ancla por software (ancla +
-// segundos de RTC-slow-clock transcurridos desde que se guardó). Si tampoco
-// hay ancla, devuelve 0 (el llamador debe usar formatTimestamp/logToSD con
-// ese caso en mente).
+// de respaldo), validada con isPlausibleEpoch() antes de confiar en ella. Si
+// no responde o su lectura es implausible, cae al esquema de ancla por
+// software (ancla + segundos de RTC-slow-clock transcurridos desde que se
+// guardó). Si tampoco hay ancla, devuelve 0 (el llamador debe usar
+// formatTimestamp/logToSD con ese caso en mente).
 uint64_t getEpochNow() {
   if (ds3231Ready) {
-    return ds3231.now().unixtime();
+    uint64_t t = ds3231.now().unixtime();
+    if (isPlausibleEpoch(t)) {
+      return t;
+    }
+    Serial.printf("[RTC] DS3231 devolvió una fecha implausible (epoch=%llu), se usa el ancla de respaldo\n",
+                  (unsigned long long)t);
   }
   if (!timeBaseSet) return 0;
   uint64_t nowRtc = getRtcTimeSeconds();
@@ -939,15 +1002,40 @@ uint64_t getEpochNow() {
   return timeBaseEpoch + elapsed;
 }
 
+// Descompone epochSeconds (UTC) en fecha/hora calendario sin pasar por
+// time_t/gmtime_r: en este framework time_t es de 32 bits con signo, así que
+// cualquier epoch por encima de ~2^31 (año 2038, o un valor corrupto/futuro
+// que el DS3231 llegue a devolver pese al filtro de isPlausibleEpoch) se
+// desbordaba a un timestamp absurdo como "1907-03-24" en vez de mostrar el
+// valor real — lo cual hacía imposible distinguir "RTC mal puesto" de "bug de
+// formato". Algoritmo de Howard Hinnant (civil_from_days), aritmética entera
+// pura, válido para cualquier epoch no negativo.
+static void epochToCivil(uint64_t epochSeconds, int &year, int &month, int &day,
+                          int &hour, int &minute, int &second) {
+  int64_t days = (int64_t)(epochSeconds / 86400ULL);
+  int64_t rem  = (int64_t)(epochSeconds % 86400ULL);
+  hour   = (int)(rem / 3600); rem %= 3600;
+  minute = (int)(rem / 60);
+  second = (int)(rem % 60);
+
+  int64_t z   = days + 719468;
+  int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  int64_t doe = z - era * 146097;                                    // [0, 146096]
+  int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+  int64_t y   = yoe + era * 400;
+  int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);              // [0, 365]
+  int64_t mp  = (5 * doy + 2) / 153;                                  // [0, 11]
+  day   = (int)(doy - (153 * mp + 2) / 5 + 1);                        // [1, 31]
+  month = (int)(mp + (mp < 10 ? 3 : -9));                             // [1, 12]
+  year  = (int)(y + (month <= 2));
+}
+
 String formatTimestamp(uint64_t epochSeconds) {
   if (epochSeconds == 0) return "NA";
-  time_t t = (time_t)epochSeconds;
-  struct tm tmStruct;
-  gmtime_r(&t, &tmStruct);
+  int y, mo, d, h, mi, s;
+  epochToCivil(epochSeconds, y, mo, d, h, mi, s);
   char buf[24];
-  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
-           tmStruct.tm_year + 1900, tmStruct.tm_mon + 1, tmStruct.tm_mday,
-           tmStruct.tm_hour, tmStruct.tm_min, tmStruct.tm_sec);
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, h, mi, s);
   return String(buf);
 }
 
@@ -955,13 +1043,10 @@ String formatTimestamp(uint64_t epochSeconds) {
 // formato esperado por el backend (Postgres/Django) para el campo "timestamp".
 String formatTimestampISO8601(uint64_t epochSeconds) {
   if (epochSeconds == 0) return "NA";
-  time_t t = (time_t)epochSeconds;
-  struct tm tmStruct;
-  gmtime_r(&t, &tmStruct);
+  int y, mo, d, h, mi, s;
+  epochToCivil(epochSeconds, y, mo, d, h, mi, s);
   char buf[24];
-  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
-           tmStruct.tm_year + 1900, tmStruct.tm_mon + 1, tmStruct.tm_mday,
-           tmStruct.tm_hour, tmStruct.tm_min, tmStruct.tm_sec);
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d", y, mo, d, h, mi, s);
   return String(buf);
 }
 
@@ -1291,6 +1376,36 @@ void setupServerRoutes() {
     request->send(200, "application/json", response);
   });
 
+  // Borra solo el archivo de datos (datalog.csv), sin tocar el resto de la
+  // tarjeta. Deliberadamente NO reusa formatSD(): ese formateo baja al driver
+  // ESP-IDF sdmmc de bajo nivel (borrado de sectores + f_mkfs) sobre el mismo
+  // bus/pines que la librería Arduino SD usa para cada logToSD() — si algo
+  // sale mal ahí, deja el subsistema SD en un estado del que initSD() ya no
+  // se recupera, y entonces ni siquiera las lecturas normales vuelven a
+  // grabarse. Este botón usa solo SD.remove() con la misma librería Arduino
+  // que ya funciona para leer/escribir en cada ciclo, así que es mucho menos
+  // riesgoso para el caso común de "quiero vaciar mis datos".
+  server.on("/deletelog", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!sdReady) initSD();  // igual que logToSD(): reintentar un remontaje antes de rendirse
+
+    StaticJsonDocument<256> doc;
+    if (!sdReady) {
+      doc["ok"] = false;
+      doc["msg"] = "Tarjeta SD no disponible";
+    } else if (!SD.exists(SD_LOG_PATH)) {
+      doc["ok"] = true;
+      doc["msg"] = "No había archivo de datos que borrar";
+    } else {
+      bool removed = SD.remove(SD_LOG_PATH);
+      doc["ok"] = removed;
+      doc["msg"] = removed ? "Archivo de datos borrado" : "No se pudo borrar el archivo (revisar tarjeta)";
+    }
+    doc["sdPresent"] = sdReady;
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
   // Formateo de SD bajo demanda (bloqueante, botón manual, destructivo).
   server.on("/formatsd", HTTP_GET, [](AsyncWebServerRequest *request) {
     // Mismo problema de watchdog que /lognow y /ltetest: formatSD() (borrado
@@ -1437,7 +1552,12 @@ void setupServerRoutes() {
       } else {
         setTimeBase(epoch);
         doc["ok"] = true;
-        doc["msg"] = "Hora sincronizada";
+        // ds3231Ready refleja si el chip respondió en este ciclo (ver setting(),
+        // que ahora lo inicializa al entrar en modo AP) — se lo devolvemos al
+        // portal para que el botón de sincronización pueda distinguir "ancla
+        // actualizada" de "DS3231 realmente reajustado".
+        doc["ds3231"] = ds3231Ready;
+        doc["msg"] = ds3231Ready ? "Hora y RTC DS3231 sincronizados" : "Hora sincronizada (DS3231 no detectado en el bus I2C)";
         doc["timestamp"] = formatTimestamp(epoch);
       }
     }
@@ -1539,6 +1659,21 @@ void setting() {
 
   // Cargar el ancla de hora real (ver /settime, setTimeBase())
   loadTimeBase();
+
+  // Encender el riel de sensores (mismo MOSFET que alimenta el DS3231, GPIO2)
+  // e iniciar I2C para que el RTC quede listo (ds3231Ready) ANTES de que el
+  // portal cargue en el navegador/celular. Así el /settime automático que
+  // dispara el JS al conectar (ver syncTime() en index_html) llega a
+  // setTimeBase() con el DS3231 ya detectado y lo reajusta con la hora real
+  // del PC/celular — sin esto, quedaba a merced de que updateSensCache() lo
+  // inicializara más tarde en el primer loop(), lo cual es una carrera con
+  // qué tan rápido el dispositivo se conecta y carga la página.
+  pinMode(SENS_PWR_PIN, OUTPUT);
+  digitalWrite(SENS_PWR_PIN, LOW);  // MOSFET canal P: LOW = ON
+  delay(100);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  delay(50);
+  initDS3231();
 
   // Desconectar WiFi completamente
   WiFi.disconnect(true);
@@ -2094,6 +2229,9 @@ String readSensors() {
   delay(50);
   initDS3231();
 
+  // Coeficientes de calibración de este equipo en particular (ver getCalCoeffs()).
+  CalCoeffs cal = getCalCoeffs();
+
   DynamicJsonDocument docOut(384);
   docOut["type"] = "weatherStationData";
   docOut["mac"] = macA();
@@ -2118,8 +2256,8 @@ String readSensors() {
     } while (!ok && retries < 5);
 
     if (ok) {
-      float tempCal = 0.5480f * temp + 9.0357f;
-      float humCal  = 0.4499f * hum + 54.7577f;
+      float tempCal = cal.tempSlope * temp + cal.tempOffset;
+      float humCal  = cal.humSlope * hum + cal.humOffset;
       docOut["T"] = String(tempCal, 2);
       docOut["H"] = String(humCal, 2);
       Serial.printf("[SENSOR] Temp: %.2f°C, Hum: %.2f%%\n", tempCal, humCal);
@@ -2138,7 +2276,7 @@ String readSensors() {
     float wv = WindVelocity();
     float wd = WindDirection();
 
-    float wvCal = 0.6448f * wv + 0.5343f;
+    float wvCal = cal.windSlope * wv + cal.windOffset;
 
     docOut["WV"] = String(wvCal, 2);
     docOut["WD"] = String(wd, 1);
