@@ -1,24 +1,31 @@
 /*
  * ============================================================================
- * WEATHER STATION - ESP32 Dev Module
+ * WEATHER STATION - LilyGO TTGO T-SIM7000G
  * ============================================================================
- * Version: PRODUCTION 26-06-2026 - HARDWARE SIM800
- * Hardware: ESP32 Dev Module + SIM800 (Serial2) + DHT22 + MT6701/AS5600 (I2C) +
- *           SD card (VSPI) + anemómetro de pulsos + pluviómetro (interrupción)
+ * Version: main-sim7000 - HARDWARE T-SIM7000G (esquemático rev 2.1, 2025-12-04)
+ * Hardware: LilyGO T-SIM7000G (ESP32 + SIM7000G integrado) + DHT21 + MT6701/AS5600
+ *           (I2C) + radiación solar RS485 + SD card integrada + anemómetro de
+ *           pulsos + pluviómetro (EXT1)
  *
  * Mapa de pines:
- *   SIM800   : RX2=16 (recibe del TX del modem) / TX2=17 (transmite al RX del modem)
- *              Alimentación controlada por MOSFET canal P en GPIO15 (LOW=ON, HIGH=OFF)
- *   Sensores : Alimentación controlada por MOSFET canal P en GPIO2/D2 (LOW=ON, HIGH=OFF)
- *   SD card  : MISO=19 MOSI=23 SCK=18 CS=5 (coincide con el bus VSPI por defecto del ESP32)
- *   Lluvia   : GPIO39 (entrada solo, sin pull interno) - wakeup por EXT1
- *   Viento   : GPIO13/D13 (velocidad por pulsos), MT6701 o AS5600 por I2C (SDA=21/SCL=22)
- *              para dirección — se elige por software (dirSensorType, /dirSensor.txt)
- *   DHT      : GPIO4 (DHT22)
- *   Batería  : GPIO34 (ADC), divisor 100k/100k.  
+ *   SIM7000G : interno de la placa — TX=27 / RX=26 (Serial1), PWRKEY=4.
+ *              El modem se alimenta directo de la batería (sin MOSFET): se
+ *              enciende/apaga por pulso de PWRKEY y AT+CPOWD.
+ *   vext1    : sensores (DHT, viento, encoder I2C, ADS1115), MOSFET canal P
+ *              AO3401 controlado por GPIO18 (vext_ctrl_1, LOW=ON, HIGH=OFF)
+ *   vext2    : boost 3.7→5V del sensor de radiación + módulo RS485, MOSFET
+ *              canal P AO3401 controlado por GPIO19 (vext_ctrl_2, LOW=ON, HIGH=OFF)
+ *   RS485    : TXD=GPIO32 / RXD=GPIO33 (Serial2, UART propio, ya no compartido con el modem)
+ *   SD card  : integrada en la placa — MISO=2 MOSI=15 SCK=14 CS=13
+ *   Lluvia   : GPIO34 (entrada solo, pull-up externo 10k a 3V3) - wakeup por EXT1
+ *   Viento   : GPIO35 (velocidad por pulsos, entrada solo, pull-up externo 10k a vext1),
+ *              MT6701 o AS5600 por I2C (SDA=21/SCL=22) para dirección — se elige
+ *              por software (dirSensorType, /dirSensor.txt)
+ *   DHT      : GPIO23 (DHT21/AM2301, pull-up 10k a vext1)
+ *   Batería  : GPIO39 (ADC_IN), divisor 390k/100k desde vBat.
  *   Botón AP : GPIO36 (modo configuración si está en LOW al arrancar).
- *              Entrada solo-lectura SIN pull interno: requiere resistencia
- *              pull-up EXTERNA a 3.3V; el botón conecta a GND al presionarlo.
+ *              Entrada solo-lectura SIN pull interno: pull-up EXTERNO 10k a
+ *              3.3V; el botón conecta a GND al presionarlo.
  */
 
 #define ARDUINOJSON_STRING_LENGTH_SIZE 4
@@ -48,7 +55,7 @@ String dirSensorType = "MT6701";
 
 /* ====================== DHT22 TEMP/HUM SETTINGS ======================== */
 #include <DHT.h>
-#define DHT_PIN  4
+#define DHT_PIN  23
 #define DHT_TYPE DHT21   // AM2301 = DHT21
 DHT dht(DHT_PIN, DHT_TYPE);
 
@@ -62,20 +69,21 @@ ClosedCube_SHT31D sht3xd;
 String tempSensorType = "DHT22";
 
 /* ====================== RS485 SETTINGS (RADIACIÓN) ======================== */
-// Sensor de radiación solar por RS485, conectado al mismo UART2 físico
-// (RX2=16/TX2=17) que usa el SIM800: solo es seguro leerlo en readSensors(),
-// ANTES de que sendDataLTE()/modemPowerOn() tomen esos pines para el modem.
-// Alimentación por MOSFET/relé en GPIO14, activo en ALTO (a diferencia de
-// los MOSFET canal P de sensores/modem, que son activos en BAJO).
-#define RS485_PWR_PIN 14
-#define RX_PIN 16
-#define TX_PIN 17
+// Sensor de radiación solar por RS485 en su propio UART (Serial2, pines
+// 32/33): el SIM7000G usa Serial1 en 26/27, así que ya no comparten pines.
+// El sensor y el módulo RS485 se alimentan de vext2 (boost 3.7→5V), cuyo
+// MOSFET canal P se controla con GPIO19 (vext_ctrl_2), activo en BAJO.
+#define RS485_PWR_PIN 19
+#define RS485_PWR_ON  LOW
+#define RS485_PWR_OFF HIGH
+#define RX_PIN 33   // red "RXD" del esquemático
+#define TX_PIN 32   // red "TXD" del esquemático
 #define BAUD_RATE 4800
 #define SERIAL_MODE SERIAL_8N1
 #define MAX_BUFFER 64
 uint8_t rs485Buffer[MAX_BUFFER];
 
-/* ====================== SD CARD SETTINGS (VSPI) ======================== */
+/* ====================== SD CARD SETTINGS (integrada T-SIM7000G) ======================== */
 #include <SPI.h>
 #include <SD.h>
 // Backend oficial ESP-IDF (empaquetado en el core arduino-esp32) usado solo
@@ -84,10 +92,10 @@ uint8_t rs485Buffer[MAX_BUFFER];
 #include <esp_vfs_fat.h>
 #include <driver/sdspi_host.h>
 #include <sdmmc_cmd.h>
-#define SD_MISO 19
-#define SD_MOSI 23
-#define SD_SCK  18
-#define SD_CS   5
+#define SD_MISO 2
+#define SD_MOSI 15
+#define SD_SCK  14
+#define SD_CS   13
 
 bool sdReady = false;
 String sdCardType = "N/A";
@@ -126,12 +134,12 @@ const char* password = "1234567890";
 String RUNssid = "";
 String RUNpass = "";
 
-/* ============================== SIM800 CONFIGURATIONS ============================== */
-#define TINY_GSM_MODEM_SIM800
+/* ============================== SIM7000G CONFIGURATIONS ============================== */
+#define TINY_GSM_MODEM_SIM7000
 #define TINY_GSM_RX_BUFFER 1024
 
 #define SerialMon Serial
-#define SerialAT Serial2
+#define SerialAT Serial1
 #define TINY_GSM_DEBUG SerialMon
 #define TINY_GSM_USE_GPRS true
 #define TINY_GSM_USE_WIFI false
@@ -152,13 +160,14 @@ const char gprsPass[] = "";
   TinyGsm modem(SerialAT);
 #endif
 
-// ESP32 Dev Module pinout
-#define UART_BAUD           9600
-#define PIN_RX2             16
-#define PIN_TX2             17
-#define MODEM_PWR_PIN       15   // MOSFET canal P: LOW=ON, HIGH=OFF
+// LilyGO T-SIM7000G: pines internos de la placa hacia el SIM7000G
+#define UART_BAUD           115200
+#define PIN_RX2             26   // RX del ESP32 (recibe del TX del modem)
+#define PIN_TX2             27   // TX del ESP32 (transmite al RX del modem)
+#define MODEM_PWRKEY_PIN    4    // PWRKEY vía transistor en la placa: pulso HIGH = PWRKEY a GND
+#define MODEM_PWRKEY_PULSE_MS 1000  // SIM7000: Ton/Toff de PWRKEY ≥1 s (datasheet)
 
-#define SENS_PWR_PIN        2    // MOSFET canal P: LOW=ON, HIGH=OFF (ctrl-sensors, D2 en esquemático)
+#define SENS_PWR_PIN        18   // vext_ctrl_1 → vext1. MOSFET canal P: LOW=ON, HIGH=OFF
 
 
 /* ============================== DEVICE CONFIGURATIONS ============================== */
@@ -210,11 +219,11 @@ WiFiClient espClient;
 PubSubClient wificlient(espClient);
 
 /* ====================== DEVICE SETTINGS ======================== */
-#define pinBattery        34   // ADC1_CH6, divisor 100k/100k
-#define pinWindVelocity   13
+#define pinBattery        39   // ADC1_CH3 (ADC_IN), divisor 390k/100k desde vBat
+#define pinWindVelocity   35   // entrada solo, pull-up externo 10k a vext1
 #define pinConfigAP       36
-#define RAINCOUNT         GPIO_NUM_39  // INPUT-ONLY PIN - NO INTERNAL PULLUP
-#define RAINCOUNT_MASK    (1ULL << 39)
+#define RAINCOUNT         GPIO_NUM_34  // INPUT-ONLY PIN - pull-up externo 10k a 3V3
+#define RAINCOUNT_MASK    (1ULL << 34)
 
 // Anemómetro: sensor Hall SS451A, 2 imanes a 180° = 2 pulsos/vuelta.
 // V(m/s) = (pulsos/2) * 2*pi*radio / tiempo * factor_calibracion
@@ -417,7 +426,7 @@ input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(1
 </div>
 
 <div class="sc" id="lteCard" style="%LTE_CARD_STYLE%">
-<h3>&#x1F4E1; Diagnóstico LTE (SIM800)</h3>
+<h3>&#x1F4E1; Diagnóstico LTE (SIM7000G)</h3>
 <form action="/get"><div class="fr"><label>APN</label><input type="text" name="apn" value="%apn%" placeholder="claro.pe / internet.movistar.pe"></div><input type="submit" value="Guardar"></form>
 <div class="ps">Ej: "claro.pe" para Claro, "internet.movistar.pe" para Movistar.</div>
 <button type="button" class="btn br heavy-btn" style="width:100%%;margin-bottom:10px" onclick="lteTest()">&#x1F4E1; Probar Conexión</button>
@@ -502,6 +511,7 @@ void modemPowerOn();
 void modemPowerOff();
 void modemRestart();
 void modemLinesOff();
+void rs485LinesOff();
 void callback(char *topic, byte *payload, unsigned int length);
 void wifiReconnect();
 void simReconnect();
@@ -729,7 +739,7 @@ void initSD() {
 bool formatSD() {
   Serial.println("[SD] Formateando tarjeta...");
 
-  // Liberar el bus VSPI que usa la librería Arduino SD antes de remontar
+  // Liberar el bus SPI que usa la librería Arduino SD antes de remontar
   // con el driver ESP-IDF (ambos necesitan control exclusivo del CS/SPI).
   SD.end();
   SPI.end();
@@ -1091,23 +1101,20 @@ void deepSleepSystem() {
   digitalWrite(SENS_PWR_PIN, HIGH);
   gpio_hold_en((gpio_num_t)SENS_PWR_PIN);
 
-  // ===== APAGAR MODEM (MOSFET canal P, HIGH=OFF) =====
-  gpio_hold_dis((gpio_num_t)MODEM_PWR_PIN);
-  pinMode(MODEM_PWR_PIN, OUTPUT);
-  digitalWrite(MODEM_PWR_PIN, HIGH);
-  gpio_hold_en((gpio_num_t)MODEM_PWR_PIN);
-
-  // ===== APAGAR SENSOR DE RADIACIÓN (activo en ALTO, así que OFF=LOW) =====
+  // ===== APAGAR SENSOR DE RADIACIÓN / vext2 (MOSFET canal P, HIGH=OFF) =====
   gpio_hold_dis((gpio_num_t)RS485_PWR_PIN);
   pinMode(RS485_PWR_PIN, OUTPUT);
-  digitalWrite(RS485_PWR_PIN, LOW);
+  digitalWrite(RS485_PWR_PIN, RS485_PWR_OFF);
   gpio_hold_en((gpio_num_t)RS485_PWR_PIN);
 
-  // ===== RX2/TX2 a LOW (no flotando): evita retroalimentar el SIM800 por
-  // los pines UART mientras está sin alimentación. Incondicional: en modo
-  // WiFi el modem nunca se enciende, así que sin esto estos pines
-  // quedarían en su estado flotante por defecto durante todo el sleep.
+  // ===== PWRKEY en reposo y UART del modem en alta impedancia =====
+  // El SIM7000G no tiene MOSFET: ya quedó apagado por AT+CPOWD en
+  // modemPowerOff() (si se encendió este ciclo). Aquí solo se asegura que
+  // PWRKEY no genere un pulso espurio durante el sleep.
   modemLinesOff();
+
+  // TX/RX del RS485 en LOW: vext2 está cortado (ver deinitRS485()).
+  rs485LinesOff();
 
   // Leer tiempo de sleep
   TIME_TO_SLEEP = readFile(SPIFFS, "/timesleep.txt").toInt();
@@ -1177,7 +1184,7 @@ void setupServerRoutes() {
   });
 
   // Diagnóstico LTE bajo demanda (bloqueante, botón manual): solo tiene
-  // sentido si connType=LTE, ya que enciende el modem SIM800 vía MOSFET.
+  // sentido si connType=LTE, ya que enciende el modem SIM7000G por PWRKEY.
   server.on("/ltetest", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (connectionType != "LTE") {
       request->send(400, "application/json", "{\"ok\":false,\"msg\":\"Modo LTE no seleccionado\"}");
@@ -1203,7 +1210,7 @@ void setupServerRoutes() {
       modemRestart();
       delay(2000);
       if (!modem.init()) {
-        doc["msg"] = "El modem SIM800 no responde";
+        doc["msg"] = "El modem SIM7000G no responde";
         modemPowerOff();
         esp_task_wdt_add(NULL);
         String response;
@@ -1537,7 +1544,7 @@ void setting() {
   // Detener I2C
   Wire.end();
 
-  // Montar SD (VSPI: MISO19/MOSI23/SCK18/CS5)
+  // Montar SD integrada (MISO2/MOSI15/SCK14/CS13)
   initSD();
 
   // Cargar el ancla de hora real (ver /settime, setTimeBase())
@@ -1592,17 +1599,17 @@ void setting() {
 
 /* ====================== BATTERY VOLTAGE ======================== */
 String vBat() {
-  int rawValue = analogRead(pinBattery);
-  // Divisor: R_top=100k, R_bottom=100k → V_bat_teórico = V_adc × (100+100)/100
-  float v_adc = rawValue * (3.3f / 4095.0f);
+  // Divisor: R_top=390k (R8), R_bottom=100k (R10) → V_bat = V_adc × (390+100)/100
+  // analogReadMilliVolts() aplica la calibración de fábrica (eFuse) del
+  // ADC, más lineal que la conversión cruda raw*3.3/4095.
+  float v_adc = analogReadMilliVolts(pinBattery) / 1000.0f;
 
-  // El ADC del ESP32 (atenuación 11dB) no es lineal en este rango: la
-  // fórmula teórica (x2) subestima la tensión real de forma consistente.
-  // Calibración de 2 puntos contra multímetro:
-  //   3.70 V real → v_adc 1.67 V (teórico daba 3.34 V)
-  //   4.20 V real → v_adc 1.93 V (teórico daba 3.86 V)
-  const float BAT_CAL_SLOPE  = 1.9231f;
-  const float BAT_CAL_OFFSET = 0.4885f;
+  // Calibración de 2 puntos contra multímetro, pendiente de medir en este
+  // hardware: SLOPE=4.9 (relación teórica del divisor) y OFFSET=0 hasta
+  // entonces. Con 390k la impedancia del divisor es alta para el ADC,
+  // así que es esperable que haga falta ajustar ambos valores.
+  const float BAT_CAL_SLOPE  = 4.9f;
+  const float BAT_CAL_OFFSET = 0.0f;
   float voltage = v_adc * BAT_CAL_SLOPE + BAT_CAL_OFFSET;
 
   return String(voltage, 2);
@@ -1684,7 +1691,7 @@ void runRainCounter() {
 
   if (elapsed >= TIME_TO_SLEEP) {
     // El ciclo ya venció mientras dormíamos: si solo reprogramamos otro
-    // período completo aquí, un GPIO39 ruidoso (sin pull-up, ver notas
+    // período completo aquí, un pin de lluvia ruidoso (ver notas
     // arriba) que siga generando wakeups EXT1 más seguido que
     // TIME_TO_SLEEP puede postergar la lectura/envío real de sensores
     // indefinidamente — el dispositivo "nunca sale" del ciclo dormir/
@@ -1702,19 +1709,19 @@ void runRainCounter() {
   Serial.printf("[RAIN] Restante: %d seg (%d min)\n", remaining, remaining / 60);
 
   // ===== APAGAR TODO (MOSFET canal P, HIGH=OFF) =====
-  gpio_hold_dis((gpio_num_t)MODEM_PWR_PIN);
-  pinMode(MODEM_PWR_PIN, OUTPUT);
-  digitalWrite(MODEM_PWR_PIN, HIGH);
-  gpio_hold_en((gpio_num_t)MODEM_PWR_PIN);
-
-  // RX2/TX2 a LOW: evita retroalimentar el SIM800 por los pines UART
-  // mientras está sin alimentación (ver modemLinesOff()).
+  // PWRKEY en reposo (ver modemLinesOff()); el modem no se enciende en
+  // este camino, así que no hace falta AT+CPOWD.
   modemLinesOff();
 
   gpio_hold_dis((gpio_num_t)SENS_PWR_PIN);
   pinMode(SENS_PWR_PIN, OUTPUT);
   digitalWrite(SENS_PWR_PIN, HIGH);
   gpio_hold_en((gpio_num_t)SENS_PWR_PIN);
+
+  gpio_hold_dis((gpio_num_t)RS485_PWR_PIN);
+  pinMode(RS485_PWR_PIN, OUTPUT);
+  digitalWrite(RS485_PWR_PIN, RS485_PWR_OFF);
+  gpio_hold_en((gpio_num_t)RS485_PWR_PIN);
 
   // Habilitar hold global
   gpio_deep_sleep_hold_en();
@@ -1801,10 +1808,8 @@ void readSHT30(float &temperature, float &humidity, bool &success) {
 // (function code 0x03, leer 4 registros desde 0x0000) y leer su respuesta.
 // Esto es lo que causaba "RAD":"error" siempre: la implementación anterior
 // solo escuchaba, sin escribir la consulta primero.
-// Enciende el sensor (GPIO14 en ALTO), abre Serial2 sobre RX2/TX2 (los
-// mismos pines físicos del SIM800, libres en este punto porque el modem
-// aún no se ha energizado — ver comentario junto a RS485_PWR_PIN).
-// Debe llamarse ANTES de sendDataLTE()/modemPowerOn() en el mismo ciclo.
+// Enciende vext2 (GPIO19 en BAJO, MOSFET canal P) y abre Serial2 sobre
+// los pines RS485 (32/33), independientes del UART del SIM7000G.
 // El manual del CWT-SI especifica "Response time: <=10S": tras energizarlo
 // en frío, la medición óptica/ADC interna del sensor tarda hasta 10 s en
 // estabilizarse. Se confirmó que 10 s FIJOS de espera sí funcionan, pero en
@@ -1827,12 +1832,24 @@ void readSHT30(float &temperature, float &humidity, bool &success) {
 // si hace falta volver a depurar.
 #define RS485_DEBUG false
 
-void initRS485() {
-  pinMode(RS485_PWR_PIN, OUTPUT);
-  digitalWrite(RS485_PWR_PIN, HIGH);  // activo en ALTO
+void rs485LinesOff() {
+  gpio_hold_dis((gpio_num_t)TX_PIN);
+  gpio_hold_dis((gpio_num_t)RX_PIN);
+  pinMode(TX_PIN, OUTPUT);
+  pinMode(RX_PIN, OUTPUT);
+  digitalWrite(TX_PIN, LOW);
+  digitalWrite(RX_PIN, LOW);
+  gpio_hold_en((gpio_num_t)TX_PIN);
+  gpio_hold_en((gpio_num_t)RX_PIN);
+}
 
-  gpio_hold_dis((gpio_num_t)PIN_TX2);
-  gpio_hold_dis((gpio_num_t)PIN_RX2);
+void initRS485() {
+  gpio_hold_dis((gpio_num_t)RS485_PWR_PIN);
+  pinMode(RS485_PWR_PIN, OUTPUT);
+  digitalWrite(RS485_PWR_PIN, RS485_PWR_ON);
+
+  gpio_hold_dis((gpio_num_t)TX_PIN);
+  gpio_hold_dis((gpio_num_t)RX_PIN);
 
   Serial2.begin(BAUD_RATE, SERIAL_MODE, RX_PIN, TX_PIN);
 }
@@ -2003,18 +2020,13 @@ int readRS485Radiation() {
   return lastValue;
 }
 
+// Apaga vext2 y deja TX/RX del RS485 en LOW con hold: con el módulo sin
+// alimentación, un HIGH (idle de UART) lo retroalimentaría por sus pines.
 void deinitRS485() {
   Serial2.end();
-  digitalWrite(RS485_PWR_PIN, LOW);
+  digitalWrite(RS485_PWR_PIN, RS485_PWR_OFF);
 
-  gpio_hold_dis((gpio_num_t)PIN_TX2);
-  gpio_hold_dis((gpio_num_t)PIN_RX2);
-  pinMode(PIN_TX2, OUTPUT);
-  pinMode(PIN_RX2, OUTPUT);
-  digitalWrite(PIN_TX2, LOW);
-  digitalWrite(PIN_RX2, LOW);
-  gpio_hold_en((gpio_num_t)PIN_TX2);
-  gpio_hold_en((gpio_num_t)PIN_RX2);
+  rs485LinesOff();
 }
 
 /* ====================== WIND FUNCTIONS ======================== */
@@ -2041,14 +2053,8 @@ void IRAM_ATTR windPulseISR() {
 // pluviómetro real: mismos dos filtros que runRainCounter() (ver ahí para
 // el detalle) — confirmar el nivel LOW un par de ms y exigir 300 ms
 // mínimo entre pulsos válidos.
-// NOTA HW: GPIO39 es input-only y el ESP32 NO tiene pull-up/down interno
-// disponible en ese pin en ningún modo (limitación de silicio, no de
-// firmware, a diferencia de GPIO13 del viento que sí lo soporta). Sin una
-// resistencia de pull externa en la placa, el pin queda flotando cuando
-// el contacto del balancín está abierto; estos filtros por software
-// reducen el ruido pero no lo eliminan del todo si el ruido persiste con
-// separación >300 ms — para una solución completa hace falta esa
-// resistencia externa (p.ej. 10k a 3.3V) en la placa.
+// NOTA HW: GPIO34 es input-only y el ESP32 NO tiene pull-up/down interno
+// en ese pin; en esta placa lo provee R5 (10k a 3V3).
 volatile unsigned long rainPulseCountISR = 0;
 volatile unsigned long lastRainPulseMillisISR = 0;
 bool rainISRAttached = false;
@@ -2078,16 +2084,16 @@ float WindDirection() {
 
 float WindVelocity() {
   // Sensor Hall: sin campo = 2.5V (HIGH), con campo = 0V (LOW). El
-  // sensor es push-pull, así que el pull-up interno (~45k) no altera su
-  // nivel activo (baja impedancia), pero define un HIGH sólido cuando el
-  // sensor está desconectado/sin alimentar; sin él, el pin flota y el
+  // sensor es push-pull, así que el pull-up externo (R1 10k a vext1; GPIO35
+  // no tiene pull interno) no altera su nivel activo, pero define un HIGH
+  // sólido cuando el sensor está desconectado; sin él, el pin flota y el
   // ruido se contaba como pulsos de viento reales.
   // Se cuentan flancos descendentes (HIGH→LOW) = cada imán que pasa,
   // con el mismo antirrebote por tiempo que windPulseISR (ver
   // WIND_PULSE_DEBOUNCE_US): con las copas detenidas y un imán justo
   // sobre el sensor, el parpadeo eléctrico en el umbral se contaba como
   // rotación real.
-  pinMode(pinWindVelocity, INPUT_PULLUP);
+  pinMode(pinWindVelocity, INPUT);  // GPIO35: sin pull interno, R1 10k a vext1
 
   int counter = 0;
   boolean lastState = digitalRead(pinWindVelocity);
@@ -2116,79 +2122,82 @@ float WindVelocity() {
   return speed;
 }
 
-/* ====================== SIM800 FUNCTIONS ======================== */
+/* ====================== SIM7000G FUNCTIONS ======================== */
 // Recuerda si el modem quedó realmente encendido este ciclo, para no
-// intentar un apagado AT (bloqueante hasta 10 s) cuando nunca se energizó
+// intentar un apagado AT (bloqueante hasta 10 s) cuando nunca se encendió
 // (p.ej. al entrar a modo config en conexión WiFi).
 bool modemPoweredOn = false;
 
-// Fuerza RX2/TX2 a salida LOW (no solo alta impedancia) y bloquea ese
-// estado con hold: dejarlos flotando (INPUT) o en HIGH (idle de UART)
-// retroalimenta el SIM800 a través de los diodos de protección ESD de
-// sus pines, energizándolo parcialmente (~2.7V medidos) incluso con el
-// MOSFET de alimentación cortado. Debe llamarse siempre que el modem no
-// esté en uso, incluido antes de cada deep sleep, sin importar el modo
-// de conexión (WiFi nunca enciende el modem, así que sin esto estos
-// pines quedarían en su estado flotante por defecto durante todo el sleep).
+// En la T-SIM7000G el modem se alimenta directo de la batería (no hay
+// MOSFET que lo corte): "apagado" es el estado tras AT+CPOWD o un pulso de
+// PWRKEY. Aquí PWRKEY queda en reposo (LOW = transistor de la placa sin
+// conducir) con hold, para que no se genere un pulso espurio durante el
+// deep sleep. RX/TX del modem quedan como entradas: no se fuerzan a LOW
+// porque la placa tiene adaptadores de nivel con pull-ups hacia el modem,
+// y un LOW sostenido consumiría corriente a través de ellos todo el sleep.
 void modemLinesOff() {
-  gpio_hold_dis((gpio_num_t)PIN_TX2);
-  gpio_hold_dis((gpio_num_t)PIN_RX2);
-  pinMode(PIN_TX2, OUTPUT);
-  pinMode(PIN_RX2, OUTPUT);
-  digitalWrite(PIN_TX2, LOW);
-  digitalWrite(PIN_RX2, LOW);
-  gpio_hold_en((gpio_num_t)PIN_TX2);
-  gpio_hold_en((gpio_num_t)PIN_RX2);
+  gpio_hold_dis((gpio_num_t)MODEM_PWRKEY_PIN);
+  pinMode(MODEM_PWRKEY_PIN, OUTPUT);
+  digitalWrite(MODEM_PWRKEY_PIN, LOW);
+  gpio_hold_en((gpio_num_t)MODEM_PWRKEY_PIN);
+
+  pinMode(PIN_TX2, INPUT);
+  pinMode(PIN_RX2, INPUT);
+}
+
+void modemPwrKeyPulse() {
+  gpio_hold_dis((gpio_num_t)MODEM_PWRKEY_PIN);
+  pinMode(MODEM_PWRKEY_PIN, OUTPUT);
+  digitalWrite(MODEM_PWRKEY_PIN, HIGH);
+  delay(MODEM_PWRKEY_PULSE_MS);
+  digitalWrite(MODEM_PWRKEY_PIN, LOW);
 }
 
 void modemPowerOn() {
-  Serial.println("[MODEM] Encendiendo SIM800...");
-
-  // Liberar el hold LOW de RX2/TX2 antes de que begin() los reconfigure
-  // como pines UART, si no, el periférico no puede tomar control de ellos.
-  gpio_hold_dis((gpio_num_t)PIN_TX2);
-  gpio_hold_dis((gpio_num_t)PIN_RX2);
-
-  gpio_hold_dis((gpio_num_t)MODEM_PWR_PIN);
-  pinMode(MODEM_PWR_PIN, OUTPUT);
-  digitalWrite(MODEM_PWR_PIN, LOW);  // MOSFET canal P: LOW = ON
-  delay(3000);  // esperar arranque del SIM800
+  Serial.println("[MODEM] Encendiendo SIM7000G...");
 
   SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX2, PIN_TX2);
+
+  // PWRKEY es un toggle: si el modem ya estaba encendido (p.ej. un ciclo
+  // anterior se reinició antes de modemPowerOff()), un pulso lo APAGARÍA.
+  // Se comprueba primero si ya responde a AT.
+  if (modem.testAT(1000)) {
+    Serial.println("[MODEM] SIM7000G ya estaba encendido");
+  } else {
+    modemPwrKeyPulse();
+    // El SIM7000G tarda ~4-5 s en aceptar comandos AT tras PWRKEY.
+    modem.testAT(10000);
+  }
   modemPoweredOn = true;
 
-  Serial.println("[MODEM] SIM800 encendido");
+  Serial.println("[MODEM] SIM7000G encendido");
 }
 
 void modemPowerOff() {
-  Serial.println("[MODEM] Apagando SIM800...");
+  Serial.println("[MODEM] Apagando SIM7000G...");
 
   if (modemPoweredOn) {
-    // Apagado ordenado (AT+CPOWD=1) antes de cortar la alimentación: si
-    // se corta el MOSFET de golpe mientras el modem sigue registrado en
-    // la red, puede quedar en un estado intermedio que sigue consumiendo
-    // corriente (LED de red parpadeando) durante todo el deep sleep del
-    // ESP32.
-    modem.poweroff();
+    // Apagado ordenado (AT+CPOWD=1): el modem sigue alimentado por la
+    // batería, así que si no se apaga aquí queda registrado en la red y
+    // consumiendo corriente durante todo el deep sleep del ESP32.
+    if (!modem.poweroff()) {
+      Serial.println("[MODEM] AT+CPOWD sin respuesta, apagando por PWRKEY");
+      modemPwrKeyPulse();
+    }
     delay(300);
   }
 
   SerialAT.end();
   modemLinesOff();
 
-  gpio_hold_dis((gpio_num_t)MODEM_PWR_PIN);
-  pinMode(MODEM_PWR_PIN, OUTPUT);
-  digitalWrite(MODEM_PWR_PIN, HIGH);  // MOSFET canal P: HIGH = OFF
-  gpio_hold_en((gpio_num_t)MODEM_PWR_PIN);
-
   modemPoweredOn = false;
 
-  Serial.println("[MODEM] SIM800 apagado");
+  Serial.println("[MODEM] SIM7000G apagado");
 }
 
 void modemRestart() {
   modemPowerOff();
-  delay(1000);
+  delay(3000);  // dar tiempo a que AT+CPOWD termine antes del nuevo pulso
   modemPowerOn();
 }
 
@@ -2439,13 +2448,8 @@ String readSensors() {
   }
 
   // ===== RADIACIÓN SOLAR (RS485) =====
-  // El módulo RS485 TTL se alimenta de V_EXT, la MISMA rail que DHT/MT6701
-  // (MOSFET SENS_PWR_PIN): debe leerse ANTES de apagar esa rail, si no el
-  // módulo queda sin alimentación junto con los demás sensores. GPIO14 solo
-  // habilita el sensor de radiación en sí (activo en ALTO), no reemplaza
-  // la alimentación general. También debe leerse antes de que
-  // sendDataLTE()/modemPowerOn() tomen RX2/TX2 para el SIM800, ya que
-  // ambos comparten el mismo UART2 físico.
+  // El sensor y el módulo RS485 TTL se alimentan de vext2 (boost 5V),
+  // independiente de vext1: initRS485()/deinitRS485() lo encienden y apagan.
   if (A_RAD) {
     Serial.println("[SENSOR] Leyendo radiación (RS485)...");
     initRS485();
@@ -2495,7 +2499,7 @@ void waitForConfig(PubSubClient &mqttClient) {
   Serial.println("[CONFIG] Fin espera");
 }
 
-/* ============MODEM ========== ENVIO LTE (SIM800) ======================== */
+/* ============MODEM ========== ENVIO LTE (SIM7000G) ======================== */
 bool sendDataLTE(String jsonData) {
   Serial.println("\n[LTE] Iniciando envío de datos...");
 
@@ -2514,6 +2518,11 @@ bool sendDataLTE(String jsonData) {
   }
 
   Serial.println("[LTE] Modem: " + modem.getModemInfo());
+
+  // SIM7000G: modo automático (GSM o LTE) y, dentro de LTE, CAT-M y NB-IoT,
+  // para que use lo que haya disponible según el operador/cobertura.
+  modem.setNetworkMode(2);   // 2=Automático, 13=solo GSM, 38=solo LTE
+  modem.setPreferredMode(3); // 1=CAT-M, 2=NB-IoT, 3=CAT-M y NB-IoT
 
   // Esperar red
   Serial.println("[LTE] Esperando red...");
@@ -2862,7 +2871,7 @@ void updateSensCache() {
       delay(50);
       initMT6701();
 
-      pinMode(pinWindVelocity, INPUT_PULLUP);
+      pinMode(pinWindVelocity, INPUT);  // GPIO35: sin pull interno, R1 10k a vext1
       attachInterrupt(digitalPinToInterrupt(pinWindVelocity), windPulseISR, FALLING);
       windISRAttached = true;
     }
@@ -2878,8 +2887,7 @@ void updateSensCache() {
 
     if (A_RAD) {
       // Se abre una sola vez y se deja activo mientras dure el modo config:
-      // en modo config el modem SIM800 nunca se usa (solo WiFi AP), así
-      // que RX2/TX2 quedan libres para el sensor de radiación.
+      // el RS485 tiene su propio UART (Serial2), independiente del modem.
       initRS485();
     }
 
@@ -3073,32 +3081,30 @@ void setup() {
 
   // ===== LIBERAR TODOS LOS GPIO HOLDS =====
   gpio_deep_sleep_hold_dis();
-  gpio_hold_dis((gpio_num_t)MODEM_PWR_PIN);
+  gpio_hold_dis((gpio_num_t)MODEM_PWRKEY_PIN);
   gpio_hold_dis((gpio_num_t)SENS_PWR_PIN);
   gpio_hold_dis((gpio_num_t)RS485_PWR_PIN);
-  gpio_hold_dis((gpio_num_t)PIN_TX2);
-  gpio_hold_dis((gpio_num_t)PIN_RX2);
+  gpio_hold_dis((gpio_num_t)TX_PIN);
+  gpio_hold_dis((gpio_num_t)RX_PIN);
 
-  // ===== ASEGURAR MODEM Y SENSORES APAGADOS =====
-  // MOSFET canal P: HIGH = OFF. A diferencia del SIM7000 no se requiere
-  // pulso de PWRKEY: toda la alimentación del módulo se corta con el MOSFET.
-  pinMode(MODEM_PWR_PIN, OUTPUT);
-  digitalWrite(MODEM_PWR_PIN, HIGH);
+  // ===== ASEGURAR SENSORES APAGADOS Y PWRKEY EN REPOSO =====
+  // vext1/vext2: MOSFET canal P, HIGH = OFF. El SIM7000G no se toca aquí:
+  // PWRKEY es un toggle, solo modemPowerOn()/modemPowerOff() lo pulsan.
+  pinMode(MODEM_PWRKEY_PIN, OUTPUT);
+  digitalWrite(MODEM_PWRKEY_PIN, LOW);
 
   pinMode(SENS_PWR_PIN, OUTPUT);
   digitalWrite(SENS_PWR_PIN, HIGH);
 
-  // Sensor de radiación RS485: activo en ALTO (a diferencia de los MOSFET
-  // canal P de arriba), así que "apagado" por defecto es un LOW simple.
   pinMode(RS485_PWR_PIN, OUTPUT);
-  digitalWrite(RS485_PWR_PIN, LOW);
+  digitalWrite(RS485_PWR_PIN, RS485_PWR_OFF);
 
-  // RX2/TX2 a LOW por defecto hasta que modemPowerOn() los reconfigure
-  // como UART: evita retroalimentar el SIM800 (ver modemLinesOff()).
-  pinMode(PIN_TX2, OUTPUT);
-  pinMode(PIN_RX2, OUTPUT);
-  digitalWrite(PIN_TX2, LOW);
-  digitalWrite(PIN_RX2, LOW);
+  // TX/RX del RS485 a LOW por defecto hasta que initRS485() los reconfigure
+  // como UART: evita retroalimentar el módulo con vext2 cortado.
+  pinMode(TX_PIN, OUTPUT);
+  pinMode(RX_PIN, OUTPUT);
+  digitalWrite(TX_PIN, LOW);
+  digitalWrite(RX_PIN, LOW);
 
   // Montar SPIFFS
   if (!SPIFFS.begin(true)) {
@@ -3138,7 +3144,7 @@ void setup() {
   Serial.printf("Total: %d bytes\n", SPIFFS.totalBytes());
   Serial.printf("Usado: %d bytes\n\n", SPIFFS.usedBytes());
 
-  // Montar SD (VSPI: MISO19/MOSI23/SCK18/CS5)
+  // Montar SD integrada (MISO2/MOSI15/SCK14/CS13)
   initSD();
 
   // Cargar el ancla de hora real (ver /settime, setTimeBase())
@@ -3152,9 +3158,9 @@ void setup() {
   if (A_PR) {
     pinMode(RAINCOUNT, INPUT);
     esp_sleep_enable_ext1_wakeup(RAINCOUNT_MASK, ESP_EXT1_WAKEUP_ALL_LOW);
-    Serial.println("[INIT] Wake por lluvia GPIO39: HABILITADO");
+    Serial.println("[INIT] Wake por lluvia GPIO34: HABILITADO");
   } else {
-    Serial.println("[INIT] Wake por lluvia GPIO39: DESHABILITADO");
+    Serial.println("[INIT] Wake por lluvia GPIO34: DESHABILITADO");
   }
 
   // Verificar razón de wake up
