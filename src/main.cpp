@@ -136,7 +136,7 @@ String RUNpass = "";
 
 /* ============================== SIM7000G CONFIGURATIONS ============================== */
 #define TINY_GSM_MODEM_SIM7000
-#define TINY_GSM_RX_BUFFER 1024
+#define TINY_GSM_RX_BUFFER 4096
 
 #define SerialMon Serial
 #define SerialAT Serial1
@@ -164,8 +164,10 @@ const char gprsPass[] = "";
 #define UART_BAUD           115200
 #define PIN_RX2             26   // RX del ESP32 (recibe del TX del modem)
 #define PIN_TX2             27   // TX del ESP32 (transmite al RX del modem)
-#define MODEM_PWRKEY_PIN    4    // PWRKEY vía transistor en la placa: pulso HIGH = PWRKEY a GND
-#define MODEM_PWRKEY_PULSE_MS 1000  // SIM7000: Ton/Toff de PWRKEY ≥1 s (datasheet)
+#define MODEM_DTR_PIN       25
+#define MODEM_PWRKEY_PIN    4    // reposo HIGH, pulso LOW (ver modemPwrKeyPulse())
+#define MODEM_PWRKEY_ON_MS  200  // SIM7000G: encendido ≥72 ms
+#define MODEM_PWRKEY_OFF_MS 1500 // SIM7000G: apagado ≥1.2 s
 
 #define SENS_PWR_PIN        18   // vext_ctrl_1 → vext1. MOSFET canal P: LOW=ON, HIGH=OFF
 
@@ -239,6 +241,16 @@ PubSubClient wificlient(espClient);
 // pulsos válidos (permite hasta ~82 m/s, muy por encima de lo esperado).
 #define MAX_WIND_SPEED_MS      75.0
 #define WIND_PULSE_DEBOUNCE_US 8000UL
+// En esta placa la señal del Hall en GPIO35 no alcanza niveles lógicos
+// válidos (medido: ~0.9 V con campo, ~1.6 V sin campo, ambos bajo el
+// umbral digital del ESP32 ~2.5 V), así que digitalRead() nunca ve un
+// flanco. Se lee por ADC con histéresis, igual que el pluviómetro: entre
+// ambos umbrales es zona muerta y no cambia el estado.
+#define WIND_ADC_FIELD_MV  1100  // por debajo: imán presente (pulso)
+#define WIND_ADC_IDLE_MV   1400  // por encima: sin campo (reposo)
+#define WIND_SAMPLE_US      500  // período de muestreo del ADC (2 kHz)
+// Imprime min/max mV y pulsos de cada WindVelocity() por el monitor serie.
+#define WIND_DEBUG true
 #define RAIN_MM_PER_TIP   0.0355  // pluviometro balancin: 4.5 ml/volcado, colector de 12.7 cm diametro
 
 // El pluviómetro también usa un sensor Hall (igual que el viento): medido
@@ -478,7 +490,7 @@ function downloadSD(name){window.location.href=name?('/downloadsd?file='+encodeU
 function logNow(){if(busy)return;setBusy(true);var r=document.getElementById('sdResult');r.innerText='Leyendo sensores y guardando... (puede tardar unos segundos)';fetch('/lognow').then(r=>r.json()).then(d=>{r.innerText=d.msg;setBusy(false);loadDataTable();}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;setBusy(false);});}
 function loadSDFileList(){if(busy)return;setBusy(true);var w=document.getElementById('sdFileListWrap');w.innerHTML='<div class="ps" style="padding:8px">Cargando...</div>';fetch('/sdlist').then(r=>r.json()).then(d=>{if(!d.files||d.files.length==0){w.innerHTML='<div class="ps" style="padding:8px">Sin archivos en la SD.</div>';return;}var html='<table><thead><tr><th>Archivo</th><th>Tamaño</th><th></th></tr></thead><tbody>';d.files.forEach(function(f){var kb=(f.size/1024).toFixed(1);html+='<tr><td>'+f.name+'</td><td>'+kb+' KB</td><td><button type="button" class="btn br" style="padding:4px 10px" onclick="downloadSD(\''+f.name+'\')">&#x2B07;</button></td></tr>';});html+='</tbody></table>';w.innerHTML=html;}).catch(e=>{w.innerHTML='<div class="ps" style="padding:8px">Error de comunicación: '+e+'</div>';}).finally(()=>setBusy(false));}
 function loadDataTable(){var w=document.getElementById('dataTableWrap');w.innerHTML='<div class="ps" style="padding:8px">Cargando...</div>';fetch('/viewdata').then(r=>r.text()).then(t=>{var lines=t.split('\n').filter(l=>l.length>0);if(lines.length<2){w.innerHTML='<div class="ps" style="padding:8px">Sin datos registrados aún.</div>';return;}var head=lines[0].split(',');var html='<table><thead><tr>';head.forEach(h=>html+='<th>'+h+'</th>');html+='</tr></thead><tbody>';for(var i=lines.length-1;i>=1;i--){var cols=lines[i].split(',');html+='<tr>';cols.forEach(c=>html+='<td>'+c+'</td>');html+='</tr>';}html+='</tbody></table>';w.innerHTML=html;}).catch(e=>{w.innerHTML='<div class="ps" style="padding:8px">Error de comunicación: '+e+'</div>';});}
-function lteTest(){if(busy)return;setBusy(true);var r=document.getElementById('lteResult');r.innerText='Probando... (enciende el modem, puede tardar hasta 20 s)';fetch('/ltetest').then(r=>r.json()).then(d=>{var lines=[];if(d.modemInfo)lines.push('Modem: '+d.modemInfo);if(d.signal!=null)lines.push('Señal (CSQ): '+d.signal+(d.signal==99?' (desconocida)':''));if(d.simReady!=null)lines.push('SIM lista: '+(d.simReady?'sí':'no'));if(d.networkRegistered!=null)lines.push('Registrado en red: '+(d.networkRegistered?'sí':'no'));if(d.operator)lines.push('Operador: '+d.operator);if(d.gprsConnected!=null)lines.push('GPRS/Internet: '+(d.gprsConnected?'sí':'no'));if(d.ip)lines.push('IP: '+d.ip);lines.push(d.msg||(d.ok?'OK':'Error'));document.getElementById('lteResult').innerHTML=lines.join('<br>');}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;}).finally(()=>setBusy(false));}
+function lteTest(){if(busy)return;setBusy(true);var r=document.getElementById('lteResult');r.innerText='Probando... (enciende el modem, el registro en red puede tardar varios minutos)';fetch('/ltetest').then(r=>r.json()).then(d=>{var lines=[];if(d.modemInfo)lines.push('Modem: '+d.modemInfo);if(d.signal!=null)lines.push('Señal (CSQ): '+d.signal+(d.signal==99?' (desconocida)':''));if(d.simReady!=null)lines.push('SIM lista: '+(d.simReady?'sí':'no'));if(d.networkRegistered!=null)lines.push('Registrado en red: '+(d.networkRegistered?'sí':'no'));if(d.operator)lines.push('Operador: '+d.operator);if(d.gprsConnected!=null)lines.push('GPRS/Internet: '+(d.gprsConnected?'sí':'no'));if(d.ip)lines.push('IP: '+d.ip);lines.push(d.msg||(d.ok?'OK':'Error'));document.getElementById('lteResult').innerHTML=lines.join('<br>');}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;}).finally(()=>setBusy(false));}
 document.querySelectorAll('form').forEach(f=>{f.onsubmit=function(e){if(this.querySelector('input[name="resetRain"]')&&!confirm('¿Reiniciar el contador de lluvia a 0? Esta acción no se puede deshacer.')){e.preventDefault();return;}if(!this.querySelector('input[name="reset"]')){e.preventDefault();fetch('/get?'+new URLSearchParams(new FormData(this))).then(()=>location.href='/').catch(()=>location.href='/');}}});
 </script>
 </body>
@@ -511,6 +523,7 @@ void modemPowerOn();
 void modemPowerOff();
 void modemRestart();
 void modemLinesOff();
+bool waitForLTENetwork();
 void rs485LinesOff();
 void callback(char *topic, byte *payload, unsigned int length);
 void wifiReconnect();
@@ -1226,7 +1239,7 @@ void setupServerRoutes() {
     doc["signal"] = csq;
     doc["simReady"] = modem.getSimStatus() == SIM_READY;
 
-    bool netOk = modem.waitForNetwork(15000L);
+    bool netOk = waitForLTENetwork();
     doc["networkRegistered"] = netOk;
 
     if (!netOk) {
@@ -2030,19 +2043,39 @@ void deinitRS485() {
 }
 
 /* ====================== WIND FUNCTIONS ======================== */
-// Contador de pulsos por interrupción, usado en modo config para calcular
-// la velocidad de forma continua (no bloqueante) en vez del muestreo de
-// polling de 3 s de WindVelocity().
-volatile unsigned long windPulseCountISR = 0;
-volatile unsigned long lastWindPulseMicrosISR = 0;
-bool windISRAttached = false;
+// Detección de pulso por ADC con histéresis (ver WIND_ADC_FIELD_MV). Se
+// cuenta un pulso solo al pasar de "reposo confirmado" a "campo
+// confirmado", con el antirrebote por tiempo de WIND_PULSE_DEBOUNCE_US.
+// Devuelve true si esta muestra completó un pulso válido.
+bool windSamplePulse(uint32_t mv, bool &idleState, unsigned long &lastPulseMicros) {
+  if (mv < WIND_ADC_FIELD_MV) {
+    bool pulse = false;
+    if (idleState) {
+      unsigned long now = micros();
+      if (now - lastPulseMicros > WIND_PULSE_DEBOUNCE_US) {
+        pulse = true;
+        lastPulseMicros = now;
+      }
+    }
+    idleState = false;
+    return pulse;
+  }
+  if (mv > WIND_ADC_IDLE_MV) idleState = true;
+  return false;
+}
 
-void IRAM_ATTR windPulseISR() {
-  // Antirrebote: ver comentario de WIND_PULSE_DEBOUNCE_US arriba.
-  unsigned long now = micros();
-  if (now - lastWindPulseMicrosISR > WIND_PULSE_DEBOUNCE_US) {
+// Contador continuo para modo config: un esp_timer muestrea el ADC cada
+// WIND_SAMPLE_US (no se puede usar attachInterrupt, la señal no tiene
+// niveles digitales válidos) y updateSensCache() calcula la velocidad.
+volatile unsigned long windPulseCountISR = 0;
+bool windISRAttached = false;
+esp_timer_handle_t windSampleTimer = nullptr;
+
+void windSampleTimerCb(void *) {
+  static bool idleState = false;
+  static unsigned long lastPulseMicros = 0;
+  if (windSamplePulse(analogReadMilliVolts(pinWindVelocity), idleState, lastPulseMicros)) {
     windPulseCountISR++;
-    lastWindPulseMicrosISR = now;
   }
 }
 
@@ -2083,36 +2116,34 @@ float WindDirection() {
 }
 
 float WindVelocity() {
-  // Sensor Hall: sin campo = 2.5V (HIGH), con campo = 0V (LOW). El
-  // sensor es push-pull, así que el pull-up externo (R1 10k a vext1; GPIO35
-  // no tiene pull interno) no altera su nivel activo, pero define un HIGH
-  // sólido cuando el sensor está desconectado; sin él, el pin flota y el
-  // ruido se contaba como pulsos de viento reales.
-  // Se cuentan flancos descendentes (HIGH→LOW) = cada imán que pasa,
-  // con el mismo antirrebote por tiempo que windPulseISR (ver
-  // WIND_PULSE_DEBOUNCE_US): con las copas detenidas y un imán justo
-  // sobre el sensor, el parpadeo eléctrico en el umbral se contaba como
-  // rotación real.
+  // Ventana de 3 s muestreando el voltaje del Hall por ADC (ver
+  // WIND_ADC_FIELD_MV): cada paso del imán (campo → reposo) es un pulso.
+  // idleState arranca en false: si la ventana empieza con el imán encima,
+  // primero hay que ver el reposo antes de contar el siguiente pulso.
   pinMode(pinWindVelocity, INPUT);  // GPIO35: sin pull interno, R1 10k a vext1
 
   int counter = 0;
-  boolean lastState = digitalRead(pinWindVelocity);
-  boolean curState;
+  bool idleState = false;
   unsigned long lastPulseMicros = micros();
+#if WIND_DEBUG
+  uint32_t mvMin = 5000, mvMax = 0;
+#endif
 
-  // 3 s de ventana de medición (600 iter × 5 ms = 3000 ms)
-  for (int i = 0; i < 600; i++) {
-    curState = digitalRead(pinWindVelocity);
-    if (lastState == HIGH && curState == LOW) {  // flanco descendente
-      unsigned long now = micros();
-      if (now - lastPulseMicros > WIND_PULSE_DEBOUNCE_US) {
-        counter++;
-        lastPulseMicros = now;
-      }
-    }
-    lastState = curState;
-    delay(5);
+  unsigned long start = millis();
+  while (millis() - start < 3000) {
+    uint32_t mv = analogReadMilliVolts(pinWindVelocity);
+#if WIND_DEBUG
+    if (mv < mvMin) mvMin = mv;
+    if (mv > mvMax) mvMax = mv;
+#endif
+    if (windSamplePulse(mv, idleState, lastPulseMicros)) counter++;
+    delayMicroseconds(WIND_SAMPLE_US);
   }
+
+#if WIND_DEBUG
+  Serial.printf("[WIND][DEBUG] GPIO%d ADC: min=%lu mV max=%lu mV, pulsos=%d\n", pinWindVelocity,
+                (unsigned long)mvMin, (unsigned long)mvMax, counter);
+#endif
 
   float speed = counter * (WIND_SPEED_PER_PULSE / 3.0);
   if (speed > MAX_WIND_SPEED_MS) {
@@ -2123,50 +2154,55 @@ float WindVelocity() {
 }
 
 /* ====================== SIM7000G FUNCTIONS ======================== */
+// Secuencias de PWRKEY/DTR, tiempos de espera y reintentos tomados del
+// firmware levelSIM7000, que sí logra registrarse en la red con esta placa.
 // Recuerda si el modem quedó realmente encendido este ciclo, para no
 // intentar un apagado AT (bloqueante hasta 10 s) cuando nunca se encendió
 // (p.ej. al entrar a modo config en conexión WiFi).
 bool modemPoweredOn = false;
 
 // En la T-SIM7000G el modem se alimenta directo de la batería (no hay
-// MOSFET que lo corte): "apagado" es el estado tras AT+CPOWD o un pulso de
-// PWRKEY. Aquí PWRKEY queda en reposo (LOW = transistor de la placa sin
-// conducir) con hold, para que no se genere un pulso espurio durante el
-// deep sleep. RX/TX del modem quedan como entradas: no se fuerzan a LOW
-// porque la placa tiene adaptadores de nivel con pull-ups hacia el modem,
-// y un LOW sostenido consumiría corriente a través de ellos todo el sleep.
+// MOSFET que lo corte): "apagado" es el estado tras AT+CPOWD o un pulso
+// largo de PWRKEY. En reposo PWRKEY queda en HIGH con hold, para que no se
+// genere un pulso espurio durante el deep sleep. RX/TX/DTR del modem quedan
+// como entradas: no se fuerzan a LOW porque la placa tiene adaptadores de
+// nivel con pull-ups hacia el modem, y un LOW sostenido consumiría
+// corriente a través de ellos todo el sleep.
 void modemLinesOff() {
   gpio_hold_dis((gpio_num_t)MODEM_PWRKEY_PIN);
   pinMode(MODEM_PWRKEY_PIN, OUTPUT);
-  digitalWrite(MODEM_PWRKEY_PIN, LOW);
+  digitalWrite(MODEM_PWRKEY_PIN, HIGH);
   gpio_hold_en((gpio_num_t)MODEM_PWRKEY_PIN);
 
   pinMode(PIN_TX2, INPUT);
   pinMode(PIN_RX2, INPUT);
+  pinMode(MODEM_DTR_PIN, INPUT);
 }
 
-void modemPwrKeyPulse() {
+// Pulso LOW en PWRKEY. SIM7000G: ≥72 ms enciende, ≥1.2 s apaga. Un pulso
+// corto de encendido no apaga un modem que ya esté encendido.
+void modemPwrKeyPulse(uint32_t lowMs) {
   gpio_hold_dis((gpio_num_t)MODEM_PWRKEY_PIN);
   pinMode(MODEM_PWRKEY_PIN, OUTPUT);
   digitalWrite(MODEM_PWRKEY_PIN, HIGH);
-  delay(MODEM_PWRKEY_PULSE_MS);
+  delay(100);
   digitalWrite(MODEM_PWRKEY_PIN, LOW);
+  delay(lowMs);
+  digitalWrite(MODEM_PWRKEY_PIN, HIGH);
 }
 
 void modemPowerOn() {
   Serial.println("[MODEM] Encendiendo SIM7000G...");
 
-  SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX2, PIN_TX2);
+  pinMode(MODEM_DTR_PIN, OUTPUT);
+  digitalWrite(MODEM_DTR_PIN, LOW);  // DTR LOW: modem despierto
 
-  // PWRKEY es un toggle: si el modem ya estaba encendido (p.ej. un ciclo
-  // anterior se reinició antes de modemPowerOff()), un pulso lo APAGARÍA.
-  // Se comprueba primero si ya responde a AT.
-  if (modem.testAT(1000)) {
-    Serial.println("[MODEM] SIM7000G ya estaba encendido");
-  } else {
-    modemPwrKeyPulse();
-    // El SIM7000G tarda ~4-5 s en aceptar comandos AT tras PWRKEY.
-    modem.testAT(10000);
+  modemPwrKeyPulse(MODEM_PWRKEY_ON_MS);
+  delay(5000);  // esperar arranque completo
+
+  SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX2, PIN_TX2);
+  if (!modem.testAT(5000)) {
+    Serial.println("[MODEM] Sin respuesta AT tras el encendido");
   }
   modemPoweredOn = true;
 
@@ -2179,12 +2215,14 @@ void modemPowerOff() {
   if (modemPoweredOn) {
     // Apagado ordenado (AT+CPOWD=1): el modem sigue alimentado por la
     // batería, así que si no se apaga aquí queda registrado en la red y
-    // consumiendo corriente durante todo el deep sleep del ESP32.
+    // consumiendo corriente durante todo el deep sleep del ESP32. Solo si
+    // no responde se usa el pulso largo de PWRKEY: si CPOWD ya lo apagó,
+    // ese pulso lo volvería a encender.
     if (!modem.poweroff()) {
       Serial.println("[MODEM] AT+CPOWD sin respuesta, apagando por PWRKEY");
-      modemPwrKeyPulse();
+      modemPwrKeyPulse(MODEM_PWRKEY_OFF_MS);
     }
-    delay(300);
+    delay(3000);  // esperar apagado completo
   }
 
   SerialAT.end();
@@ -2197,8 +2235,43 @@ void modemPowerOff() {
 
 void modemRestart() {
   modemPowerOff();
-  delay(3000);  // dar tiempo a que AT+CPOWD termine antes del nuevo pulso
+  delay(1000);
   modemPowerOn();
+}
+
+// Reinicio "suave" del modem (AT+CFUN=1,1) sin pasar por PWRKEY: primer
+// intento de recuperación cuando no hay registro de red.
+void modemATReset() {
+  Serial.println("[MODEM] Reset por comando AT (AT+CFUN=1,1)...");
+  modem.sendAT("+CFUN=1,1");
+  modem.waitResponse(10000L);
+  delay(8000);  // esperar reinicio interno del modem tras el CFUN
+
+  if (!modem.init()) {
+    Serial.println("[MODEM] Sin respuesta tras reset AT");
+  }
+}
+
+// El registro de red del SIM7000G puede tardar varios minutos (búsqueda de
+// banda/operador): 60 s aborta la búsqueda antes de tiempo. 2 intentos de
+// hasta 4 min, con reset entre ambos (AT+CFUN) si el primero falla.
+bool waitForLTENetwork() {
+  const int maxAttempts = 2;
+  const uint32_t networkTimeoutMs = 240000L;
+
+  for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+    int csq = modem.getSignalQuality();
+    Serial.printf("[LTE] Intento %d/%d - Señal (CSQ): %d - esperando hasta %lu s...\n",
+                  attempt, maxAttempts, csq, networkTimeoutMs / 1000);
+
+    if (modem.waitForNetwork(networkTimeoutMs)) {
+      return true;
+    }
+
+    Serial.printf("[ERROR] Sin cobertura de red (intento %d/%d)\n", attempt, maxAttempts);
+    if (attempt < maxAttempts) modemATReset();
+  }
+  return false;
 }
 
 /* ====================== MQTT CALLBACK ======================== */
@@ -2519,15 +2592,17 @@ bool sendDataLTE(String jsonData) {
 
   Serial.println("[LTE] Modem: " + modem.getModemInfo());
 
-  // SIM7000G: modo automático (GSM o LTE) y, dentro de LTE, CAT-M y NB-IoT,
-  // para que use lo que haya disponible según el operador/cobertura.
-  modem.setNetworkMode(2);   // 2=Automático, 13=solo GSM, 38=solo LTE
-  modem.setPreferredMode(3); // 1=CAT-M, 2=NB-IoT, 3=CAT-M y NB-IoT
+  // Recibir la hora de la red (NITZ) al registrarse, para
+  // syncTimeFromInternetLTE(); &W la guarda en el modem.
+  modem.sendAT(GF("+CLTS=1"));
+  modem.waitResponse();
+  modem.sendAT(GF("&W"));
+  modem.waitResponse();
 
-  // Esperar red
+  // Esperar red (con reintentos y reset si no hay registro)
   Serial.println("[LTE] Esperando red...");
-  if (!modem.waitForNetwork(60000L)) {
-    Serial.println("[ERROR] Sin cobertura de red");
+  if (!waitForLTENetwork()) {
+    Serial.println("[ERROR] Sin cobertura de red (tras reintentos y reset del modem)");
     modemPowerOff();
     return false;
   }
@@ -2552,6 +2627,7 @@ bool sendDataLTE(String jsonData) {
   if (topicPub == "") topicPub = "jhpAI/FAUNA/data";
 
   simclient.setServer(serverIP.c_str(), mqtt_port);
+  simclient.setBufferSize(512);  // el payload puede superar los 256 bytes por defecto
 
   // Conectar a MQTT
   int mqttRetries = 0;
@@ -2652,6 +2728,7 @@ bool sendDataWiFi(String jsonData) {
   if (topicPub == "") topicPub = "jhpAI/FAUNA/data";
 
   wificlient.setServer(serverIP.c_str(), mqtt_port);
+  wificlient.setBufferSize(512);  // el payload puede superar los 256 bytes por defecto
 
   // Conectar a MQTT
   int mqttRetries = 0;
@@ -2872,7 +2949,11 @@ void updateSensCache() {
       initMT6701();
 
       pinMode(pinWindVelocity, INPUT);  // GPIO35: sin pull interno, R1 10k a vext1
-      attachInterrupt(digitalPinToInterrupt(pinWindVelocity), windPulseISR, FALLING);
+      esp_timer_create_args_t timerArgs = {};
+      timerArgs.callback = windSampleTimerCb;
+      timerArgs.name = "windSample";
+      esp_timer_create(&timerArgs, &windSampleTimer);
+      esp_timer_start_periodic(windSampleTimer, WIND_SAMPLE_US);
       windISRAttached = true;
     }
 
@@ -3088,10 +3169,10 @@ void setup() {
   gpio_hold_dis((gpio_num_t)RX_PIN);
 
   // ===== ASEGURAR SENSORES APAGADOS Y PWRKEY EN REPOSO =====
-  // vext1/vext2: MOSFET canal P, HIGH = OFF. El SIM7000G no se toca aquí:
-  // PWRKEY es un toggle, solo modemPowerOn()/modemPowerOff() lo pulsan.
+  // vext1/vext2: MOSFET canal P, HIGH = OFF. PWRKEY en reposo (HIGH); solo
+  // modemPowerOn()/modemPowerOff() generan pulsos LOW.
   pinMode(MODEM_PWRKEY_PIN, OUTPUT);
-  digitalWrite(MODEM_PWRKEY_PIN, LOW);
+  digitalWrite(MODEM_PWRKEY_PIN, HIGH);
 
   pinMode(SENS_PWR_PIN, OUTPUT);
   digitalWrite(SENS_PWR_PIN, HIGH);
