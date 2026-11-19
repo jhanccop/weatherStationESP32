@@ -8,8 +8,14 @@
  *
  * Mapa de pines:
  *   SIM800   : RX2=16 (recibe del TX del modem) / TX2=17 (transmite al RX del modem)
- *              Alimentación controlada por MOSFET canal P en GPIO15 (LOW=ON, HIGH=OFF)
+ *              Alimentación por GPIO15 (sim_control) -> NPN Q4 -> MOSFET canal P Q1:
+ *              lógica NO invertida (HIGH=ON, LOW=OFF). El mismo sim_control también
+ *              enciende (Q5 -> Q3) el elevador SX1308 de 12V del módulo RS485.
  *   Sensores : Alimentación controlada por MOSFET canal P en GPIO2/D2 (LOW=ON, HIGH=OFF)
+ *              (v_sensor: DHT, viento, encoder, OLED, conector I2C, RS485 TTL)
+ *   OLED     : 0.96" SSD1306 128x64 por I2C (0x3C, mismo bus SDA=21/SCL=22), VCC = v_sensor
+ *   Botones  : BUT1 "ok" = GPIO35, BUT2 "up" = GPIO27 (pull-up externo 100k, activos LOW).
+ *              "ok" además despierta del deep sleep (EXT0) para consultar el estado.
  *   SD card  : MISO=19 MOSI=23 SCK=18 CS=5 (coincide con el bus VSPI por defecto del ESP32)
  *   Lluvia   : GPIO39 (entrada solo, sin pull interno) - wakeup por EXT1
  *   Viento   : GPIO13/D13 (velocidad por pulsos), MT6701 o AS5600 por I2C (SDA=21/SCL=22)
@@ -18,7 +24,7 @@
  *              da la marca de tiempo real; mantiene la hora con su propia batería
  *              de respaldo aunque el equipo pierda alimentación por completo.
  *   DHT      : GPIO4 (DHT22)
- *   Batería  : GPIO34 (ADC), divisor 100k/100k.  
+ *   Batería  : GPIO34 (ADC), divisor R10=390k / R11=100k.
  *   Botón AP : GPIO36 (modo configuración si está en LOW al arrancar).
  *              Entrada solo-lectura SIN pull interno: requiere resistencia
  *              pull-up EXTERNA a 3.3V; el botón conecta a GND al presionarlo.
@@ -33,6 +39,7 @@
 #include <esp_task_wdt.h>
 
 #include "soc/rtc.h"
+#include "soc/rtc_cntl_reg.h"
 
 /* ====================== I2C BUS (MT6701) ======================== */
 #include <Wire.h>
@@ -61,6 +68,48 @@ String dirSensorType = "MT6701";
 RTC_DS3231 ds3231;
 bool ds3231Ready = false;
 
+/* ====================== OLED 0.96" SSD1306 (I2C) + BOTONES ======================== */
+// Mismo bus I2C que el encoder y el DS3231 (sin conflicto de direcciones:
+// OLED 0x3C, AS5600 0x36, MT6701 0x06, DS3231 0x68). Su VCC sale de v_sensor
+// (MOSFET de GPIO2): solo funciona con el riel de sensores encendido, en deep
+// sleep queda sin alimentación y hay que re-inicializarlo en cada despertar.
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#define OLED_W     128
+#define OLED_H     64
+#define OLED_ROTATION 3   // vertical (64x128); 1 = vertical girado 180°
+#define OLED_ADDR  0x3C
+Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, -1);
+bool oledReady = false;
+bool oledOpEnabled = true;  // mostrar el progreso en modo operación (/oledOp.txt)
+
+// Botones del esquemático: pull-up externo de 100k a 3.3V, activos en LOW.
+// GPIO35 es solo-entrada (sin pull interno) y pin RTC: sirve como wakeup EXT0.
+#define BTN_OK_PIN 35   // BUT1 "ok"
+#define BTN_UP_PIN 27   // BUT2 "up"
+#define BTN_DEBOUNCE_MS 30
+#define BTN_LONG_MS     2000
+#define OLED_CONFIG_TIMEOUT_MS 120000UL  // apaga la pantalla en modo config sin uso
+#define STATUS_VIEW_TIMEOUT_MS 30000UL   // consulta de estado (wakeup por botón)
+
+/* ====================== RS485 (Modbus RTU) ======================== */
+// Módulo TTL-RS485 con control de dirección automático (sin pin DE/RE),
+// alimentado por v_sensor (GPIO2). El sensor en sí toma 12V del elevador
+// SX1308 (A2), que habilita sim_control (GPIO15) — la MISMA señal que
+// enciende el modem: leer el sensor energiza también el SIM800 unos segundos.
+// Usa UART1 (Serial1) porque UART2 (Serial2) es del SIM800.
+// rs485Type (persistido en /rs485.txt, elegible desde el portal AP o por
+// MQTT) define qué sensor hay conectado:
+//   "SOIL": suelo 4-en-1, 9600 baud, regs 0..3 = hum/10, temp/10, EC, pH/10
+//   "RAD" : piranómetro, 4800 baud, reg 0 = radiación (W/m²)
+#define RS485_TX_PIN      32   // net "TXD" del esquemático
+#define RS485_RX_PIN      33   // net "RXD" del esquemático
+#define RS485_SLAVE_ADDR  1
+#define RS485_WARMUP_MS   1500 // elevador 12V + arranque del sensor
+#define RS485_TIMEOUT_MS  500
+#define RS485_RETRIES     3
+String rs485Type = "NONE";     // "NONE" | "SOIL" | "RAD"
+
 /* ====================== DHT22 TEMP/HUM SETTINGS ======================== */
 #include <DHT.h>
 #define DHT_PIN  4
@@ -87,7 +136,10 @@ uint64_t sdTotalMB = 0;
 uint64_t sdUsedMB = 0;
 uint64_t sdFreeMB = 0;
 
-#define SD_LOG_PATH "/datalog.csv"
+// v2: columnas RS485 (ST,SH,EC,PH,RAD) añadidas al final. Archivo nuevo para
+// no mezclar filas de distinto ancho con el encabezado del datalog.csv viejo,
+// que queda en la tarjeta (descargable desde la lista de archivos).
+#define SD_LOG_PATH "/datalog_v2.csv"
 
 /* ================ MARCA DE TIEMPO (hora real, sin RTC chip) ================ */
 // El ESP32 no tiene un RTC con batería propia ni GPS/NTP en este hardware, así
@@ -148,7 +200,45 @@ const char gprsPass[] = "";
 #define UART_BAUD           9600
 #define PIN_RX2             16
 #define PIN_TX2             17
-#define MODEM_PWR_PIN       15   // MOSFET canal P: LOW=ON, HIGH=OFF
+// sim_control: GPIO15 -> R1 47k -> base NPN Q4 (R13 100k a GND); el colector
+// baja el gate del MOSFET canal P Q1. Por el NPN la lógica queda HIGH=ON.
+// También alimenta el elevador de 12V del RS485 (Q5/Q3) en paralelo.
+#define MODEM_PWR_PIN       15
+#define MODEM_PWR_ON        HIGH
+#define MODEM_PWR_OFF       LOW
+
+// Arranque suave del riel del modem: en vez de cerrar el MOSFET de golpe
+// (el condensador de entrada del SIM800 y del SX1308 se cargan con un pico
+// de corriente que hunde VCC y resetea el ESP32 por brownout), se pulsa
+// sim_control por PWM con ciclo útil creciente durante MODEM_SOFTSTART_MS.
+// 0 = desactivado (encendido directo como antes).
+#define MODEM_SOFTSTART_MS   400
+#define MODEM_SOFTSTART_FREQ 500   // Hz: período de 2 ms
+#define MODEM_SOFTSTART_CH   7     // canal LEDC libre
+
+/* ================== GESTIÓN DE ENERGÍA (BATERÍA) ================== */
+// Umbrales sobre vBat() medido en reposo (modem apagado). DEPENDEN de que
+// vBat() esté calibrado contra un multímetro (ver BAT_CAL_SLOPE/OFFSET).
+#define BAT_VALID_MIN_V      2.50f  // por debajo: lectura inválida (sin divisor / alimentación USB) → no se aplica ninguna regla
+#define BAT_MODEM_MIN_V      3.55f  // por debajo: no se enciende el modem (los picos de 2 A tirarían el sistema)
+#define BAT_CRITICAL_V       3.40f  // por debajo: período de sleep × LOW_BAT_SLEEP_FACTOR
+#define LOW_BAT_SLEEP_FACTOR 4
+#define NET_BACKOFF_MAX_SKIP 8
+
+// Durante la sesión del modem (registro en red, GPRS, MQTT) los picos de TX
+// del SIM800 pueden hundir VCC del ESP32 un instante por debajo del umbral
+// de brownout (2.43 V, ya el mínimo) y resetearlo aunque el ESP32 seguiría
+// funcionando. 1 = desactivar el detector solo mientras el modem está
+// encendido y restaurarlo al apagarlo. Es un parche: la solución real es de
+// hardware (LDO de baja caída para el ESP32, ver CLAUDE.md).
+#define MODEM_BROWNOUT_RIDE_THROUGH 1
+
+// Banda GSM forzada en el SIM800 (AT+CBAND). En 850/900 MHz el SIM800
+// transmite a 2 W (picos ~2 A); en 1800/1900 MHz a 1 W (picos ~1.2 A).
+// "PCS_MODE" = solo 1900 (Claro Perú usa 1900 y 850 según zona: verificar
+// cobertura antes de forzarla). "" = no tocar la configuración del modem.
+#define MODEM_BAND ""
+      // tras fallos seguidos, intentar envío como mucho cada 8 ciclos
 
 #define SENS_PWR_PIN        2    // MOSFET canal P: LOW=ON, HIGH=OFF (ctrl-sensors, D2 en esquemático)
 
@@ -174,6 +264,31 @@ RTC_DATA_ATTR uint64_t lastRainPulseRtcTicks = 0;
 // el tiempo de procesamiento (modem, sensores, MQTT) del próximo sleep y
 // así evitar el desfase acumulado en el período configurado.
 uint64_t bootRtcSeconds = 0;
+
+// Resumen del último ciclo de operación, en memoria RTC (sobrevive al deep
+// sleep) para mostrarlo en el OLED al despertar con el botón "ok", sin tener
+// que volver a medir ni conectarse.
+RTC_DATA_ATTR char lastDataJson[512] = "";
+RTC_DATA_ATTR char lastNetStatus[24] = "";
+RTC_DATA_ATTR char lastSignal[16] = "";
+
+// Gestión de energía. sleepFactor vive en RTC para que sleepRemainingCycle()
+// (wakes por lluvia/botón) use el mismo período alargado que deepSleepSystem().
+RTC_DATA_ATTR uint8_t sleepFactor = 1;
+RTC_DATA_ATTR uint32_t opCycleCount = 0;
+RTC_DATA_ATTR int16_t lastModemMv = -1;
+// Último paso del modem en curso. RTC_NOINIT (no RTC_DATA): el bootloader
+// reinicializa .rtc.data en cualquier reset que no sea un wake de deep
+// sleep, y lo que interesa es justamente sobrevivir a un brownout.
+#define MODEM_STEP_MAGIC 0x5A11C0DEUL
+RTC_NOINIT_ATTR uint32_t modemStepMagic;
+RTC_NOINIT_ATTR char modemStep[24];   // tensión que mide el propio SIM800 (AT+CBC)
+// Racha de envíos fallidos (en SPIFFS: un reset por brownout puede borrar la
+// memoria RTC, y justamente esos resets son los que hay que contar).
+int netFailStreak = 0;
+bool brownoutBoot = false;
+bool lastCycleSent = false;  // resultado del envío de este ciclo (resumen OLED)   // este arranque viene de un reset por brownout
+float cycleBatV = -1;        // batería medida en este ciclo, en reposo
 
 /* Device settings */
 boolean A_TH = false;
@@ -201,10 +316,10 @@ WiFiClient espClient;
 PubSubClient wificlient(espClient);
 
 /* ====================== DEVICE SETTINGS ======================== */
-#define pinBattery        34   // ADC1_CH6, divisor 100k/100k
+#define pinBattery        34   // ADC1_CH6, divisor R10=390k / R11=100k
 #define pinWindVelocity   13
 #define pinConfigAP       36
-#define RAINCOUNT         GPIO_NUM_39  // INPUT-ONLY PIN - NO INTERNAL PULLUP
+#define RAINCOUNT         GPIO_NUM_39  // INPUT-ONLY PIN - sin pull interno; la placa trae R8=10k a 3.3V
 #define RAINCOUNT_MASK    (1ULL << 39)
 
 // Anemómetro: sensor Hall SS451A, 2 imanes a 180° = 2 pulsos/vuelta.
@@ -246,6 +361,8 @@ struct {
   String temp = "--", hum  = "--";
   String rain = "--", wvel = "--", wdir = "--", bat = "--";
   String rainStatus = "--", rainCount = "--";
+  String rsT = "--", rsH = "--", rsEC = "--", rsPH = "--", rsRad = "--";
+  String rs485 = "--";  // resumen de una línea para la UI web
 } sensCache;
 
 /* ====================== HTML PAGE ======================== */
@@ -321,6 +438,7 @@ input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(1
 <div class="sb"><div class="sl">&#x2601; Estado Lluvia</div><div class="sv" id="rainStatus">--</div></div>
 <div class="sb"><div class="sl">&#x1F4A8; Vel. Viento</div><div class="sv" id="wvel">--</div></div>
 <div class="sb"><div class="sl">&#x1F9ED; Dir. Viento</div><div class="sv" id="wdir">--</div></div>
+<div class="sb" style="grid-column:1/-1"><div class="sl">&#x1F50C; RS485 (cada 30 s)</div><div class="sv" id="rs485" style="font-size:14px">--</div></div>
 </div>
 <div class="ps">Última actualización: <span id="upd">--</span> (cada 1 s, local)</div>
 </div>
@@ -339,6 +457,20 @@ input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(1
 <option value="AS5600" %AS5600_SELECTED%>AS5600 (brújula magnética)</option>
 </select>
 <input type="submit" value="Guardar Módulo">
+</form>
+<form action="/get">
+<label>Sensor RS485 (Modbus RTU, dirección 1)</label>
+<select name="rs485">
+<option value="NONE" %RS485_NONE%>Ninguno</option>
+<option value="SOIL" %RS485_SOIL%>Suelo: temp, humedad, EC, pH (9600 baud)</option>
+<option value="RAD" %RS485_RAD%>Radiación solar W/m² (4800 baud)</option>
+</select>
+<input type="submit" value="Guardar RS485">
+</form>
+<form action="/get">
+<input type="hidden" name="oledForm" value="1">
+<label><input type="checkbox" name="oledOp" value="1" %OLED_OP_CHECKED%>Mostrar progreso en OLED en modo operación (mantiene v_sensor encendido todo el ciclo, más consumo)</label>
+<input type="submit" value="Guardar Pantalla">
 </form>
 <div class="rc">
 <div><div class="sl">&#x1F327; Vaciadas acumuladas</div><div class="sv" id="rainCounterVal">--</div></div>
@@ -440,7 +572,7 @@ input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(1
 // mismo polling) terminan en "Failed to fetch" aunque el equipo siga vivo.
 var busy=false;
 function setBusy(b){busy=b;document.querySelectorAll('.heavy-btn').forEach(function(el){el.disabled=b;});}
-function u(){if(busy)return;fetch('/sensors').then(r=>r.json()).then(d=>{document.getElementById('temp').innerText=d.temp!='NA'?d.temp+'°C':'--';document.getElementById('hum').innerText=d.hum!='NA'?d.hum+'%%':'--';document.getElementById('rain').innerText=d.rain!='NA'?d.rain+' mm':'--';document.getElementById('rainStatus').innerText=d.rainStatus!='NA'?d.rainStatus:'--';document.getElementById('wvel').innerText=d.wvel!='NA'?d.wvel+' m/s':'--';document.getElementById('wdir').innerText=d.wdir!='NA'?d.wdir+'°':'--';document.getElementById('bat').innerText=d.bat||'--';var rc=document.getElementById('rainCounterVal');if(rc)rc.innerText=d.rainCount!='NA'?d.rainCount:'--';document.getElementById('upd').innerText=new Date().toLocaleTimeString();}).catch(e=>console.log(e));}
+function u(){if(busy)return;fetch('/sensors').then(r=>r.json()).then(d=>{document.getElementById('temp').innerText=d.temp!='NA'?d.temp+'°C':'--';document.getElementById('hum').innerText=d.hum!='NA'?d.hum+'%%':'--';document.getElementById('rain').innerText=d.rain!='NA'?d.rain+' mm':'--';document.getElementById('rainStatus').innerText=d.rainStatus!='NA'?d.rainStatus:'--';document.getElementById('wvel').innerText=d.wvel!='NA'?d.wvel+' m/s':'--';document.getElementById('wdir').innerText=d.wdir!='NA'?d.wdir+'°':'--';document.getElementById('bat').innerText=d.bat||'--';document.getElementById('rs485').innerText=d.rs485&&d.rs485!='NA'?d.rs485:'Deshabilitado';var rc=document.getElementById('rainCounterVal');if(rc)rc.innerText=d.rainCount!='NA'?d.rainCount:'--';document.getElementById('upd').innerText=new Date().toLocaleTimeString();}).catch(e=>console.log(e));}
 u();setInterval(u,1000);
 function syncTime(){fetch('/settime?epoch='+Math.floor(Date.now()/1000)).then(r=>r.json()).then(d=>{var tb=document.getElementById('timeBase');if(tb&&d.ok)tb.innerText=d.timestamp+' UTC (ancla)';}).catch(e=>console.log(e));}
 syncTime();
@@ -469,11 +601,12 @@ void setting();
 void setupServerRoutes();
 String vBat();
 void runRainCounter();
-void readDHT22(float &temperature, float &humidity, bool &success);
+void readDHT22(float &temperature, float &humidity, bool &success, bool force = false);
 float WindDirection();
 float WindVelocity();
 void modemPowerOn();
 void modemPowerOff();
+void modemApplyBand();
 void modemRestart();
 void modemLinesOff();
 void callback(char *topic, byte *payload, unsigned int length);
@@ -505,6 +638,22 @@ bool syncTimeFromInternetWiFi();
 bool syncTimeFromInternetLTE();
 void appendPendingRecord(const String &jsonLine);
 bool flushPendingData(PubSubClient &mqttClient, const String &topicPub);
+int countPendingRecords();
+void armWakeSources(uint64_t sleepSeconds);
+void sleepRemainingCycle();
+void sensorsRailOn();
+bool oledInit();
+void oledPower(bool on);
+void oledBegin(const String &header);
+void oledLog(const String &line);
+void setNetStatus(const char *msg);
+void buttonsInit();
+void configOledTask();
+void runStatusViewer();
+void modemRailOn();
+uint64_t configuredSleepPeriod();
+struct Rs485Data;
+bool readRS485(Rs485Data &d);
 
 /* ====================== HTML SCRIPTS ======================== */
 void notFound(AsyncWebServerRequest *request) {
@@ -614,6 +763,15 @@ String processor(const String& var) {
     return readFile(SPIFFS, "/A_PR.txt") == "1" ? "checked" : "";
   } else if (var == "A_WS_CHECKED") {
     return readFile(SPIFFS, "/A_WS.txt") == "1" ? "checked" : "";
+  } else if (var == "RS485_NONE") {
+    String v = readFile(SPIFFS, "/rs485.txt");
+    return (v != "SOIL" && v != "RAD") ? "selected" : "";
+  } else if (var == "RS485_SOIL") {
+    return readFile(SPIFFS, "/rs485.txt") == "SOIL" ? "selected" : "";
+  } else if (var == "RS485_RAD") {
+    return readFile(SPIFFS, "/rs485.txt") == "RAD" ? "selected" : "";
+  } else if (var == "OLED_OP_CHECKED") {
+    return readFile(SPIFFS, "/oledOp.txt") != "0" ? "checked" : "";
   } else if (var == "MT6701_SELECTED") {
     String dirSensor = readFile(SPIFFS, "/dirSensor.txt");
     return (dirSensor == "AS5600") ? "" : "selected";
@@ -817,7 +975,7 @@ void logToSD(const String &jsonLine) {
   }
 
   if (isNew) {
-    f.println("timestamp,epoch_s,mac,conn,T,H,WV,WD,RA,vB");
+    f.println("timestamp,epoch_s,mac,conn,T,H,WV,WD,RA,vB,ST,SH,EC,PH,RAD");
   }
 
   // 256 se quedaba corto y descartaba el registro entero (DeserializationError
@@ -828,7 +986,8 @@ void logToSD(const String &jsonLine) {
   // ese payload real ronda ~300 bytes con los 10 campos actuales. 512 deja
   // margen para nombres de conexión o timestamps un poco más largos sin
   // volver a quedarse sin memoria.
-  StaticJsonDocument<512> doc;
+  // 768: los 5 campos RS485 suman ~60 bytes de texto y 5 nodos más.
+  StaticJsonDocument<768> doc;
   DeserializationError err = deserializeJson(doc, jsonLine);
   if (err) {
     Serial.println("[SD] Error parseando JSON para CSV: " + String(err.c_str()));
@@ -847,6 +1006,11 @@ void logToSD(const String &jsonLine) {
   row += ","; row += doc["WD"].as<String>();
   row += ","; row += doc["RA"].as<String>();
   row += ","; row += doc["vB"].as<String>();
+  row += ","; row += doc["ST"].as<String>();
+  row += ","; row += doc["SH"].as<String>();
+  row += ","; row += doc["EC"].as<String>();
+  row += ","; row += doc["PH"].as<String>();
+  row += ","; row += doc["RAD"].as<String>();
 
   // println() no reporta fallos de escritura de otra forma (disco lleno,
   // tarjeta caída a media escritura): comparar los bytes devueltos contra el
@@ -1091,10 +1255,57 @@ bool flushPendingData(PubSubClient &mqttClient, const String &topicPub) {
   return true;
 }
 
+// Período de sleep configurado (/timesleep.txt, mínimo 60 s) multiplicado
+// por el factor de batería baja vigente.
+uint64_t configuredSleepPeriod() {
+  uint64_t period = readFile(SPIFFS, "/timesleep.txt").toInt();
+  if (period < 60) period = 300;
+  return period * (sleepFactor ? sleepFactor : 1);
+}
+
+// Número de lecturas en cola de reenvío (líneas no vacías de /pending.jsonl).
+int countPendingRecords() {
+  if (!SPIFFS.exists(PENDING_LOG_PATH)) return 0;
+  File f = SPIFFS.open(PENDING_LOG_PATH, FILE_READ);
+  if (!f) return 0;
+  int count = 0;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) count++;
+  }
+  f.close();
+  return count;
+}
+
 /* ========================= DEEP SLEEP ========================= */
+
+// Fuentes de wakeup comunes a todos los caminos que duermen.
+void armWakeSources(uint64_t sleepSeconds) {
+  esp_sleep_enable_timer_wakeup(sleepSeconds * uS_TO_S_FACTOR);
+
+  // habilita solo si esta activado el sensor de lluvia
+  if (A_PR) {
+    esp_sleep_enable_ext1_wakeup(RAINCOUNT_MASK, ESP_EXT1_WAKEUP_ALL_LOW);
+  }
+
+  // Botón "ok" (GPIO35, activo LOW): despierta para consultar el estado en
+  // el OLED (runStatusViewer()). Solo se arma si está suelto: atascado en
+  // LOW (o sin su pull-up externo) despertaría en bucle sin parar.
+  rtc_gpio_deinit((gpio_num_t)BTN_OK_PIN);
+  pinMode(BTN_OK_PIN, INPUT);
+  if (digitalRead(BTN_OK_PIN) == HIGH) {
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)BTN_OK_PIN, 0);
+  } else {
+    Serial.println("[SLEEP] Botón ok presionado/atascado: wake por botón DESHABILITADO");
+  }
+}
 
 void deepSleepSystem() {
   Serial.println("\n[SLEEP] Preparando deep sleep...");
+
+  // Apagar el panel antes de cortarle v_sensor
+  oledPower(false);
 
   // ===== APAGAR SENSORES (MOSFET canal P, HIGH=OFF) =====
   gpio_hold_dis((gpio_num_t)SENS_PWR_PIN);
@@ -1102,10 +1313,10 @@ void deepSleepSystem() {
   digitalWrite(SENS_PWR_PIN, HIGH);
   gpio_hold_en((gpio_num_t)SENS_PWR_PIN);
 
-  // ===== APAGAR MODEM (MOSFET canal P, HIGH=OFF) =====
+  // ===== APAGAR MODEM + 12V RS485 (sim_control, NPN+MOSFET: LOW=OFF) =====
   gpio_hold_dis((gpio_num_t)MODEM_PWR_PIN);
   pinMode(MODEM_PWR_PIN, OUTPUT);
-  digitalWrite(MODEM_PWR_PIN, HIGH);
+  digitalWrite(MODEM_PWR_PIN, MODEM_PWR_OFF);
   gpio_hold_en((gpio_num_t)MODEM_PWR_PIN);
 
   // ===== RX2/TX2 a LOW (no flotando): evita retroalimentar el SIM800 por
@@ -1114,9 +1325,17 @@ void deepSleepSystem() {
   // quedarían en su estado flotante por defecto durante todo el sleep.
   modemLinesOff();
 
+  // Batería crítica: alargar el período para que la celda se recupere / el
+  // panel la cargue antes del próximo ciclo. Se vuelve a evaluar cada ciclo.
+  if (cycleBatV >= BAT_VALID_MIN_V) {
+    sleepFactor = (cycleBatV < BAT_CRITICAL_V) ? LOW_BAT_SLEEP_FACTOR : 1;
+    if (sleepFactor > 1) {
+      Serial.printf("[POWER] Batería crítica (%.2f V): período × %d\n", cycleBatV, sleepFactor);
+    }
+  }
+
   // Leer tiempo de sleep
-  TIME_TO_SLEEP = readFile(SPIFFS, "/timesleep.txt").toInt();
-  if (TIME_TO_SLEEP < 60) TIME_TO_SLEEP = 300;
+  TIME_TO_SLEEP = configuredSleepPeriod();
 
   // Compensar el tiempo despierto (encender modem, leer sensores, publicar
   // MQTT, esperar config) para que el período real entre wakeups por timer
@@ -1140,16 +1359,9 @@ void deepSleepSystem() {
   // ===== HABILITAR HOLD DURANTE DEEP SLEEP =====
   gpio_deep_sleep_hold_en();
 
-  // Configurar wake ups
-  esp_sleep_enable_timer_wakeup(sleepSeconds * uS_TO_S_FACTOR);
-
-  // habilita solo si esta activado el sensor de lluvia
-  if (A_PR) {
-    esp_sleep_enable_ext1_wakeup(RAINCOUNT_MASK, ESP_EXT1_WAKEUP_ALL_LOW);
-    Serial.println("[SLEEP] Wake por lluvia: HABILITADO");
-  } else {
-    Serial.println("[SLEEP] Wake por lluvia: DESHABILITADO");
-  }
+  // Configurar wake ups (timer + lluvia si A_PR + botón "ok")
+  armWakeSources(sleepSeconds);
+  Serial.printf("[SLEEP] Wake por lluvia: %s\n", A_PR ? "HABILITADO" : "DESHABILITADO");
 
   Serial.println("[SLEEP] Entrando en deep sleep...\n");
   Serial.flush();
@@ -1175,6 +1387,7 @@ void setupServerRoutes() {
     doc["wvel"] = sensCache.wvel;
     doc["wdir"] = sensCache.wdir;
     doc["bat"]  = sensCache.bat;
+    doc["rs485"] = sensCache.rs485;
     String response;
     serializeJson(doc, response);
     request->send(200, "application/json", response);
@@ -1218,6 +1431,7 @@ void setupServerRoutes() {
     }
 
     doc["modemInfo"] = modem.getModemInfo();
+    modemApplyBand();
 
     int16_t csq = modem.getSignalQuality();
     doc["signal"] = csq;
@@ -1503,6 +1717,17 @@ void setupServerRoutes() {
       TIME_TO_SLEEP = period.toInt();
       Serial.println("[SAVE] Period: " + period + " seg");
     }
+    else if (request->hasParam("rs485")) {
+      String val = request->getParam("rs485")->value();
+      if (val != "SOIL" && val != "RAD") val = "NONE";
+      writeFile(SPIFFS, "/rs485.txt", val.c_str());
+      rs485Type = val;
+      Serial.println("[SAVE] rs485: " + val);
+    }
+    else if (request->hasParam("oledForm")) {
+      writeFile(SPIFFS, "/oledOp.txt", request->hasParam("oledOp") ? "1" : "0");
+      Serial.println("[SAVE] OLED en operación: " + String(request->hasParam("oledOp") ? "1" : "0"));
+    }
     else if (request->hasParam("resetRain")) {
       writeFile(SPIFFS, "/ssidRainCounter.txt", "0");
       rainPulseCountISR = 0;
@@ -1527,15 +1752,610 @@ void setupServerRoutes() {
   server.onNotFound(notFound);
 }
 
+/* ====================== OLED + BOTONES ======================== */
+// Pantalla en vertical (rotada 90°): 64 x 128 px, 10 columnas x 16 filas
+// con la fuente 6x8. Las cadenas van sin tildes: la fuente por defecto de
+// Adafruit GFX no trae UTF-8.
+//
+// Dashboard (dashDraw()):
+//   y   0-10  barra de estado: batería (icono + %) | tipo de enlace + señal
+//   y  13-21  modo (OPER / CONFIG / ESTADO) invertido
+//   y  24-95  solo los sensores HABILITADOS, una fila cada uno
+//   y  98-125 proceso: paso actual + 2 líneas de detalle
+//   y 126-127 barra de progreso de la secuencia
+
+void sensorsRailOn() {
+  gpio_hold_dis((gpio_num_t)SENS_PWR_PIN);
+  pinMode(SENS_PWR_PIN, OUTPUT);
+  digitalWrite(SENS_PWR_PIN, LOW);  // MOSFET canal P: LOW = ON
+}
+
+// Requiere v_sensor encendido y Wire ya iniciado (SDA=21/SCL=22).
+bool oledInit() {
+  if (oledReady) return true;
+  delay(100);  // arranque del SSD1306 tras energizar v_sensor
+
+  // Adafruit_SSD1306::begin() no verifica el ACK del bus: sin este sondeo
+  // reportaría éxito aunque el panel no esté conectado.
+  Wire.beginTransmission(OLED_ADDR);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("[OLED] No detectado en 0x3C");
+    return false;
+  }
+  // periphBegin=false: no re-inicializar Wire con los pines por defecto
+  if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR, false, false)) {
+    Serial.println("[OLED] Sin memoria para el buffer");
+    return false;
+  }
+  oled.setRotation(OLED_ROTATION);
+  oled.setTextWrap(false);
+  oled.clearDisplay();
+  oled.display();
+  oledReady = true;
+  Serial.println("[OLED] Listo");
+  return true;
+}
+
+void oledPower(bool on) {
+  if (oledReady) oled.ssd1306_command(on ? SSD1306_DISPLAYON : SSD1306_DISPLAYOFF);
+}
+
+/* ---------- Estado del dashboard ---------- */
+enum DashVal { DV_T, DV_H, DV_WV, DV_WD, DV_RA, DV_ST, DV_SH, DV_EC, DV_PH, DV_RAD, DV_COUNT };
+
+struct Dash {
+  String mode = "";         // OPER / CONFIG / ESTADO
+  String link = "";         // LTE / WIFI / SD
+  float batV = 0;
+  int8_t bars = -1;         // señal 0..4, -1 = sin dato
+  String step = "";         // paso actual de la secuencia
+  String detail[2];         // detalle del paso (o resultado)
+  uint8_t stepIdx = 0, stepTotal = 0;
+  String v[DV_COUNT];       // valores ya formateados, "--" = sin dato
+} dash;
+
+void dashDraw();
+
+int csqToBars(int csq) {
+  if (csq <= 1 || csq == 99) return 0;
+  if (csq < 10) return 1;
+  if (csq < 15) return 2;
+  if (csq < 20) return 3;
+  return 4;
+}
+
+int rssiToBars(int rssi) {
+  if (rssi >= -55) return 4;
+  if (rssi >= -65) return 3;
+  if (rssi >= -75) return 2;
+  if (rssi >= -85) return 1;
+  return 0;
+}
+
+// Li-ion 1S: 3.30 V = 0 %, 4.20 V = 100 % (aprox. lineal, suficiente aquí)
+int batPercent(float v) {
+  int p = (int)((v - 3.30f) * 100.0f / 0.90f);
+  return p < 0 ? 0 : (p > 100 ? 100 : p);
+}
+
+String dashLinkName(const String &type) {
+  if (type == "LTE") return "LTE";
+  if (type == "WIFI") return "WIFI";
+  if (type == "DATALOGER") return "SD";
+  return type.substring(0, 4);
+}
+
+// Pasos de la secuencia del modo operación según el tipo de enlace
+uint8_t dashStepsFor(const String &type) {
+  if (type == "LTE") return 8;    // SENSORES SD MODEM RED GPRS MQTT ENVIO FIN
+  if (type == "WIFI") return 6;   // SENSORES SD WIFI MQTT ENVIO FIN
+  return 3;                       // SENSORES SD FIN
+}
+
+void dashBegin(const String &mode, uint8_t totalSteps) {
+  dash.mode = mode;
+  dash.link = dashLinkName(connectionType);
+  dash.batV = vBat().toFloat();
+  dash.bars = -1;
+  dash.step = "";
+  dash.detail[0] = dash.detail[1] = "";
+  dash.stepIdx = 0;
+  dash.stepTotal = totalSteps;
+  for (int i = 0; i < DV_COUNT; i++) dash.v[i] = "--";
+  dashDraw();
+}
+
+// Detalle de 2 líneas: corta en un espacio si el texto no cabe en una.
+void dashSetDetail(const String &text) {
+  String t = text;
+  t.trim();
+  if (t.length() <= 10) {
+    dash.detail[0] = t;
+    dash.detail[1] = "";
+    return;
+  }
+  int cut = t.lastIndexOf(' ', 10);
+  if (cut <= 0) cut = 10;
+  dash.detail[0] = t.substring(0, cut);
+  String rest = t.substring(cut);
+  rest.trim();
+  dash.detail[1] = rest.substring(0, 10);
+}
+
+// Nuevo paso de la secuencia (avanza la barra de progreso)
+void dashStep(const String &step, const String &detail = "") {
+  if (!oledReady) return;
+  dash.step = step;
+  if (dash.stepIdx < dash.stepTotal) dash.stepIdx++;
+  dashSetDetail(detail);
+  dashDraw();
+}
+
+// Último paso (resultado): completa la barra aunque se hayan saltado pasos
+void dashFinish(const String &result, const String &detail = "") {
+  if (!oledReady) return;
+  dash.step = result;
+  dash.stepIdx = dash.stepTotal;
+  dashSetDetail(detail);
+  dashDraw();
+}
+
+void dashSet(DashVal idx, const String &value) {
+  dash.v[idx] = value;
+  if (oledReady) dashDraw();
+}
+
+void dashSignal(int bars) {
+  dash.bars = bars;
+  if (oledReady) dashDraw();
+}
+
+// Detalle del paso en curso (compatibilidad: todos los mensajes de
+// progreso del firmware pasan por aquí).
+void oledLog(const String &line) {
+  if (!oledReady) return;
+  dashSetDetail(line);
+  dashDraw();
+}
+
+void oledBegin(const String &mode) {
+  dashBegin(mode, dashStepsFor(connectionType));
+}
+
+// Valor de un sensor tal como llega del JSON / caché ("error", "NA"...)
+String dashFmt(const String &raw, int decimals, const char *unit) {
+  if (raw == "" || raw == "--" || raw == "NA" || raw == "null") return "--";
+  if (raw == "error") return "ERR";
+  return String(raw.toFloat(), decimals) + unit;
+}
+
+String dashFmtDir(const String &raw) {
+  if (raw == "" || raw == "--" || raw == "NA" || raw == "null") return "--";
+  if (raw == "error") return "ERR";
+  static const char *pts[] = {"N", "NE", "E", "SE", "S", "SO", "O", "NO"};
+  float d = raw.toFloat();
+  int i = ((int)((d + 22.5f) / 45.0f)) & 7;
+  return String((int)(d + 0.5f) % 360) + " " + pts[i];
+}
+
+// Carga los valores de un JSON de lectura (lastDataJson) en el dashboard
+void dashLoadJson(JsonDocument &d) {
+  dash.v[DV_T]   = dashFmt(d["T"] | "--", 1, "C");
+  dash.v[DV_H]   = dashFmt(d["H"] | "--", 0, "%");
+  dash.v[DV_WV]  = dashFmt(d["WV"] | "--", 1, "m/s");
+  dash.v[DV_WD]  = dashFmtDir(d["WD"] | "--");
+  dash.v[DV_RA]  = d.containsKey("RA") ? d["RA"].as<String>() : "--";
+  dash.v[DV_ST]  = dashFmt(d["ST"] | "--", 1, "C");
+  dash.v[DV_SH]  = dashFmt(d["SH"] | "--", 0, "%");
+  dash.v[DV_EC]  = dashFmt(d["EC"] | "--", 0, "uS");
+  dash.v[DV_PH]  = dashFmt(d["PH"] | "--", 1, "");
+  dash.v[DV_RAD] = dashFmt(d["RAD"] | "--", 0, "W");
+}
+
+/* ---------- Dibujo ---------- */
+void dashText(int x, int y, const String &s, bool inverse = false) {
+  oled.setTextColor(inverse ? SSD1306_BLACK : SSD1306_WHITE);
+  oled.setCursor(x, y);
+  oled.print(s);
+  oled.setTextColor(SSD1306_WHITE);
+}
+
+void dashTextRight(int y, const String &s, bool inverse = false) {
+  dashText(oled.width() - 6 * (int)s.length(), y, s, inverse);
+}
+
+void dashDrawBattery(int x, int y) {
+  // Cuerpo 13x7 + borne 2x3
+  oled.drawRect(x, y, 13, 7, SSD1306_WHITE);
+  oled.fillRect(x + 13, y + 2, 2, 3, SSD1306_WHITE);
+  if (dash.batV < BAT_VALID_MIN_V) {
+    dashText(x + 18, y, "USB");
+    return;
+  }
+  int pct = batPercent(dash.batV);
+  oled.fillRect(x + 2, y + 2, (9 * pct + 50) / 100, 3, SSD1306_WHITE);
+  dashText(x + 18, y, String(pct) + "%");
+}
+
+void dashDrawBars(int x, int y) {
+  // 4 barras de 2 px, alturas 2/4/6/8; sin dato = solo la base
+  for (int i = 0; i < 4; i++) {
+    int h = 2 + i * 2;
+    int bx = x + i * 3;
+    if (dash.bars > i) oled.fillRect(bx, y + 8 - h, 2, h, SSD1306_WHITE);
+    else oled.drawFastHLine(bx, y + 7, 2, SSD1306_WHITE);
+  }
+}
+
+void dashRow(int y, const char *label, const String &value) {
+  dashText(0, y, String(label).substring(0, 3));
+  dashTextRight(y, value.substring(0, 7));
+}
+
+void dashDraw() {
+  if (!oledReady) return;
+  const int W = oled.width();
+  oled.clearDisplay();
+
+  // Barra de estado
+  dashDrawBattery(0, 1);
+  if (dash.link != "SD") dashDrawBars(W - 11, 1);
+
+  // Modo + enlace (invertido)
+  oled.fillRect(0, 12, W, 10, SSD1306_WHITE);
+  dashText(1, 13, dash.mode, true);
+  dashTextRight(13, dash.link, true);
+
+  // Sensores habilitados
+  int y = 25;
+  const int rowH = 8;
+  // Nombres de 3 caracteres: TSU/HSU = temperatura/humedad del suelo
+  if (A_TH) { dashRow(y, "TEM", dash.v[DV_T]); y += rowH; dashRow(y, "HUM", dash.v[DV_H]); y += rowH; }
+  if (A_WS) { dashRow(y, "VEL", dash.v[DV_WV]); y += rowH; dashRow(y, "DIR", dash.v[DV_WD]); y += rowH; }
+  if (A_PR) { dashRow(y, "LLU", dash.v[DV_RA]); y += rowH; }
+  if (rs485Type == "SOIL") {
+    dashRow(y, "TSU", dash.v[DV_ST]); y += rowH;
+    dashRow(y, "HSU", dash.v[DV_SH]); y += rowH;
+    dashRow(y, "EC", dash.v[DV_EC]); y += rowH;
+    dashRow(y, "PH", dash.v[DV_PH]); y += rowH;
+  } else if (rs485Type == "RAD") {
+    dashRow(y, "RAD", dash.v[DV_RAD]); y += rowH;
+  }
+  if (y == 25) dashText(0, y, "Sin sens.");
+
+  // Proceso
+  oled.drawFastHLine(0, 97, W, SSD1306_WHITE);
+  dashText(0, 100, dash.step.substring(0, 10));
+  dashText(0, 109, dash.detail[0]);
+  dashText(0, 117, dash.detail[1]);
+  if (dash.stepTotal > 0) {
+    oled.drawFastHLine(0, 127, W, SSD1306_WHITE);
+    oled.fillRect(0, 125, W * dash.stepIdx / dash.stepTotal, 3, SSD1306_WHITE);
+  }
+  oled.display();
+}
+
+// Página de información (vertical): título invertido + filas "clave/valor".
+// Cada entrada ocupa 1 fila si cabe ("CSQ    14") o 2 si no (clave arriba,
+// valor abajo, alineado a la derecha).
+void oledInfoPage(const String &title, const String keys[], const String vals[], int n, const String &footer) {
+  if (!oledReady) return;
+  const int W = oled.width();
+  oled.clearDisplay();
+  oled.fillRect(0, 0, W, 10, SSD1306_WHITE);
+  dashText(1, 1, title.substring(0, 10), true);
+  int y = 13;
+  const int yMax = footer.length() ? 110 : 120;
+  for (int i = 0; i < n && y <= yMax; i++) {
+    String v = vals[i].substring(0, 10);
+    if (keys[i].length() + 1 + v.length() <= 10) {
+      dashText(0, y, keys[i]);
+      dashTextRight(y, v);
+      y += 9;
+    } else {
+      if (y + 9 > yMax) break;
+      dashText(0, y, keys[i]);
+      dashTextRight(y + 8, v);
+      y += 18;
+    }
+  }
+  if (footer.length()) {
+    oled.drawFastHLine(0, 118, W, SSD1306_WHITE);
+    dashText(0, 120, footer.substring(0, 10));
+  }
+  oled.display();
+}
+
+// Resultado de la conectividad de este ciclo: se muestra y queda guardado
+// en memoria RTC para la consulta de estado posterior.
+void setNetStatus(const char *msg) {
+  strlcpy(lastNetStatus, msg, sizeof(lastNetStatus));
+  oledLog(msg);
+}
+
+/* ---------- Botones (antirrebote + pulsación corta/larga) ---------- */
+enum BtnEvent { BTN_NONE, BTN_SHORT, BTN_LONG };
+
+struct Button {
+  uint8_t pin;
+  bool raw;                 // última lectura (true = presionado)
+  bool stable;              // estado ya filtrado por antirrebote
+  bool suppress;            // ignorar hasta soltar (ya disparó LONG o venía presionado)
+  unsigned long rawChangedAt;
+  unsigned long downAt;
+};
+
+Button btnOk = {BTN_OK_PIN, false, false, false, 0, 0};
+Button btnUp = {BTN_UP_PIN, false, false, false, 0, 0};
+
+void buttonInit(Button &b) {
+  pinMode(b.pin, INPUT);  // pull-up externo (R18/R19 100k)
+  b.raw = b.stable = b.suppress = (digitalRead(b.pin) == LOW);
+  b.rawChangedAt = b.downAt = millis();
+}
+
+void buttonsInit() {
+  // Si venimos de un wakeup EXT0, GPIO35 sigue en modo RTC IO
+  rtc_gpio_deinit((gpio_num_t)BTN_OK_PIN);
+  // Un botón que ya está presionado al iniciar (p.ej. el mismo toque que
+  // despertó al equipo) no genera evento hasta que se suelte.
+  buttonInit(btnOk);
+  buttonInit(btnUp);
+}
+
+BtnEvent pollButton(Button &b) {
+  bool raw = (digitalRead(b.pin) == LOW);
+  unsigned long now = millis();
+  if (raw != b.raw) {
+    b.raw = raw;
+    b.rawChangedAt = now;
+  }
+  if (now - b.rawChangedAt < BTN_DEBOUNCE_MS) return BTN_NONE;
+
+  if (raw != b.stable) {
+    b.stable = raw;
+    if (raw) {
+      b.downAt = now;
+      return BTN_NONE;
+    }
+    bool wasSuppressed = b.suppress;
+    b.suppress = false;
+    return wasSuppressed ? BTN_NONE : BTN_SHORT;
+  }
+  if (raw && !b.suppress && (now - b.downAt) >= BTN_LONG_MS) {
+    b.suppress = true;
+    return BTN_LONG;
+  }
+  return BTN_NONE;
+}
+
+/* ---------- Vistas del modo configuración ---------- */
+// 0 = dashboard en vivo (sensCache) | 1 = red | 2 = sistema
+#define CONFIG_PAGES 3
+
+void drawConfigPage(int page, bool fresh) {
+  // Lo que sale de SPIFFS se relee solo al cambiar de página (readFile()
+  // registra cada lectura en el monitor serie y se redibuja cada segundo).
+  static String cType, cNetKey, cNet, cServer, cPeriod;
+  static int cPending = 0;
+  static unsigned long lastBat = 0;
+  if (fresh) {
+    cType = readFile(SPIFFS, "/connType.txt");
+    dash.link = dashLinkName(cType);
+    if (cType == "LTE") { cNetKey = "APN"; cNet = readFile(SPIFFS, "/apn.txt"); }
+    else if (cType == "DATALOGER") { cNetKey = "Envio"; cNet = "no (SD)"; }
+    else { cNetKey = "SSID"; cNet = readFile(SPIFFS, "/ssidString.txt"); }
+    cServer = readFile(SPIFFS, "/server.txt");
+    if (cServer == "") cServer = broker;
+    cPeriod = String(readFile(SPIFFS, "/timesleep.txt").toInt() / 60) + "min";
+    cPending = countPendingRecords();
+  }
+
+  const String footer = "OK2s:salir";
+  if (page == 0) {
+    if (fresh || millis() - lastBat >= 5000) {
+      dash.batV = vBat().toFloat();
+      lastBat = millis();
+    }
+    dash.v[DV_T]   = dashFmt(sensCache.temp, 1, "C");
+    dash.v[DV_H]   = dashFmt(sensCache.hum, 0, "%");
+    dash.v[DV_WV]  = dashFmt(sensCache.wvel, 1, "m/s");
+    dash.v[DV_WD]  = dashFmtDir(sensCache.wdir);
+    dash.v[DV_RA]  = (sensCache.rainCount == "NA") ? "--" : sensCache.rainCount;
+    dash.v[DV_ST]  = dashFmt(sensCache.rsT, 1, "C");
+    dash.v[DV_SH]  = dashFmt(sensCache.rsH, 0, "%");
+    dash.v[DV_EC]  = dashFmt(sensCache.rsEC, 0, "uS");
+    dash.v[DV_PH]  = dashFmt(sensCache.rsPH, 1, "");
+    dash.v[DV_RAD] = dashFmt(sensCache.rsRad, 0, "W");
+    dash.step = serverReady ? "AP LISTO" : "INICIANDO";
+    dash.detail[0] = WiFi.softAPIP().toString();
+    dash.detail[1] = "Clientes " + String(WiFi.softAPgetStationNum());
+    dash.stepIdx = dash.stepTotal;
+    dashDraw();
+    return;
+  }
+  if (page == 1) {
+    String k[] = {"AP", "Clave", "IP", "Enlace", cNetKey, "MQTT", "Periodo", "Pend."};
+    String v[] = {String(ssid), String(password), WiFi.softAPIP().toString(), dashLinkName(cType),
+                  cNet, cServer, cPeriod, String(cPending)};
+    oledInfoPage("RED", k, v, 8, footer);
+    return;
+  }
+  String k[] = {"Fecha", "Hora", "SD", "MAC", "RS485"};
+  String ts = formatTimestamp(getEpochNow());  // AAAA-MM-DDTHH:MM:SS
+  String mac = macA();
+  mac.replace(":", "");
+  String v[] = {ts.substring(0, 10), ts.substring(11, 19),
+                sdReady ? String((unsigned long)sdFreeMB) + "MB" : "no",
+                mac, rs485Type};
+  oledInfoPage("SISTEMA", k, v, 5, footer);
+}
+
+// Llamada en cada vuelta de loop() en modo configuración.
+//   UP corto: vista siguiente   OK corto: vista anterior
+//   OK largo (2 s): salir del modo config (reinicia en modo operación)
+// La pantalla se apaga tras OLED_CONFIG_TIMEOUT_MS sin uso; cualquier botón
+// la vuelve a encender (ese toque no cambia de vista).
+void configOledTask() {
+  static int page = 0;
+  static bool screenOn = true;
+  static bool fresh = true;
+  static unsigned long lastDraw = 0;
+  static unsigned long lastActivity = millis();
+
+  if (!oledReady) return;
+
+  BtnEvent up = pollButton(btnUp);
+  BtnEvent ok = pollButton(btnOk);
+
+  if (up != BTN_NONE || ok != BTN_NONE) {
+    lastActivity = millis();
+    if (!screenOn) {
+      screenOn = true;
+      oledPower(true);
+      fresh = true;
+      up = ok = BTN_NONE;
+    }
+  }
+
+  if (up == BTN_SHORT) { page = (page + 1) % CONFIG_PAGES; fresh = true; }
+  if (ok == BTN_SHORT) { page = (page + CONFIG_PAGES - 1) % CONFIG_PAGES; fresh = true; }
+  if (ok == BTN_LONG) {
+    dash.stepIdx = dash.stepTotal;
+    dash.step = "SALIENDO";
+    dash.detail[0] = "modo";
+    dash.detail[1] = "operacion";
+    dashDraw();
+    Serial.println("[OLED] Salida del modo config por botón");
+    delay(1500);
+    ESP.restart();
+  }
+
+  if (screenOn && millis() - lastActivity > OLED_CONFIG_TIMEOUT_MS) {
+    screenOn = false;
+    oledPower(false);
+  }
+
+  if (screenOn && (fresh || millis() - lastDraw >= 1000)) {
+    drawConfigPage(page, fresh);
+    fresh = false;
+    lastDraw = millis();
+  }
+}
+
+/* ---------- Consulta de estado (wakeup EXT0 por botón "ok") ---------- */
+// 0 = dashboard de la última medición | 1 = conectividad | 2 = sistema
+#define STATUS_PAGES 3
+
+void drawStatusPage(int page, int pending) {
+  const String footer = "OK2s:medir";
+  uint64_t elapsed = getRtcTimeSeconds() - cycle_start_rtc;
+  long next = (cycle_active && elapsed < TIME_TO_SLEEP) ? (long)(TIME_TO_SLEEP - elapsed) : 0;
+
+  if (page == 0) {
+    dash.step = "PROX " + String(next) + "s";
+    dashSetDetail(lastNetStatus[0] ? lastNetStatus : "Sin datos");
+    dash.stepTotal = 0;  // sin barra de progreso en esta vista
+    dashDraw();
+    return;
+  }
+  if (page == 1) {
+    String k[] = {"Enlace", "Ultimo", "Senal", "Vmodem", "Pend.", "Prox."};
+    String v[] = {dashLinkName(connectionType),
+                  lastNetStatus[0] ? String(lastNetStatus) : "--",
+                  lastSignal[0] ? String(lastSignal) : "--",
+                  lastModemMv > 0 ? String(lastModemMv / 1000.0f, 2) + "V" : "--",
+                  String(pending), String(next) + "s"};
+    oledInfoPage("CONEXION", k, v, 6, footer);
+    return;
+  }
+  static String brownouts = readFile(SPIFFS, "/brownouts.txt");
+  String k[] = {"Fecha", "Hora", "SD", "Periodo", "Ciclos", "Brownout"};
+  String ts = formatTimestamp(getEpochNow());
+  String v[] = {ts.substring(0, 10), ts.substring(11, 19),
+                sdReady ? String((unsigned long)sdFreeMB) + "MB" : "no",
+                String((unsigned long)(TIME_TO_SLEEP / 60)) + "min",
+                String(opCycleCount), brownouts};
+  oledInfoPage("SISTEMA", k, v, 6, footer);
+}
+
+// Despertar por el botón "ok" (EXT0): muestra el resumen del último ciclo
+// sin medir ni conectarse, y vuelve a dormir solo lo que resta del período
+// (sleepRemainingCycle()), así no se corre el horario de los reportes.
+//   UP/OK corto: cambiar página   OK largo (2 s): medir y enviar ahora
+void runStatusViewer() {
+  Serial.println("\n[OLED] ===== CONSULTA DE ESTADO (botón ok) =====");
+
+  connectionType = readFile(SPIFFS, "/connType.txt");
+  TIME_TO_SLEEP = configuredSleepPeriod();
+
+  sensorsRailOn();
+  delay(50);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  initDS3231();
+
+  if (!oledInit()) {
+    sleepRemainingCycle();  // No retorna
+    return;
+  }
+  buttonsInit();
+
+  dashBegin("ESTADO", 0);
+  {
+    StaticJsonDocument<1024> d;
+    if (lastDataJson[0] && !deserializeJson(d, (const char *)lastDataJson)) dashLoadJson(d);
+  }
+  if (strncmp(lastSignal, "CSQ ", 4) == 0) dash.bars = csqToBars(atoi(lastSignal + 4));
+  else if (lastSignal[0]) dash.bars = rssiToBars(atoi(lastSignal));
+
+  int pending = countPendingRecords();
+  int page = 0;
+  bool redraw = true;
+  unsigned long lastActivity = millis();
+  unsigned long lastDraw = 0;
+
+  while (millis() - lastActivity < STATUS_VIEW_TIMEOUT_MS) {
+    BtnEvent up = pollButton(btnUp);
+    BtnEvent ok = pollButton(btnOk);
+    if (up != BTN_NONE || ok != BTN_NONE) lastActivity = millis();
+
+    if (up == BTN_SHORT) { page = (page + 1) % STATUS_PAGES; redraw = true; }
+    if (ok == BTN_SHORT) { page = (page + STATUS_PAGES - 1) % STATUS_PAGES; redraw = true; }
+    if (ok == BTN_LONG) {
+      Serial.println("[OLED] Ciclo manual solicitado por botón");
+      init_running();  // No retorna, entra en deep sleep
+      return;
+    }
+
+    if (redraw || millis() - lastDraw >= 1000) {
+      drawStatusPage(page, pending);
+      redraw = false;
+      lastDraw = millis();
+    }
+    delay(20);
+  }
+
+  sleepRemainingCycle();  // No retorna
+}
+
 /* ====================== SETTING MODE ======================== */
 void setting() {
   Serial.println("\n[SETTING MODE] Iniciando...");
 
-  // Detener I2C
-  Wire.end();
+  // OLED: necesita v_sensor y el bus I2C desde el inicio para mostrar el
+  // progreso; updateSensCache() vuelve a encender el riel (sin efecto) y su
+  // Wire.begin() posterior no reinicia un bus ya iniciado.
+  sensorsRailOn();
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if (oledInit()) {
+    dashBegin("CONFIG", 3);   // SD, AP, LISTO
+    dashStep("INICIO");
+  }
+  buttonsInit();
 
   // Montar SD (VSPI: MISO19/MOSI23/SCK18/CS5)
   initSD();
+  dashStep("SD", sdReady ? "OK" : "no detectada");
 
   // Cargar el ancla de hora real (ver /settime, setTimeBase())
   loadTimeBase();
@@ -1547,6 +2367,7 @@ void setting() {
 
   // Configurar modo AP
   Serial.println("[SETTING] Configurando Access Point...");
+  dashStep("AP WIFI", "creando...");
   WiFi.mode(WIFI_AP);
   delay(500);
 
@@ -1567,6 +2388,7 @@ void setting() {
 
   if (retries >= 5) {
     Serial.println("[ERROR] No se pudo crear AP");
+    dashFinish("ERROR AP", "reiniciando");
     delay(2000);
     ESP.restart();
     return;
@@ -1578,6 +2400,7 @@ void setting() {
   IPAddress IP = WiFi.softAPIP();
   Serial.print("[OK] AP activo en: ");
   Serial.println(IP);
+  dashFinish("AP LISTO", IP.toString());
 
   // Configurar rutas HTTP (función separada)
   Serial.println("[SETTING] Configurando rutas HTTP...");
@@ -1589,18 +2412,22 @@ void setting() {
 
 /* ====================== BATTERY VOLTAGE ======================== */
 String vBat() {
-  int rawValue = analogRead(pinBattery);
-  // Divisor: R_top=100k, R_bottom=100k → V_bat_teórico = V_adc × (100+100)/100
-  float v_adc = rawValue * (3.3f / 4095.0f);
+  // Divisor del esquemático: R10=390k (arriba) / R11=100k (abajo) →
+  // V_bat = V_adc × (390+100)/100. Con 4.2 V de batería el ADC ve ~0.86 V,
+  // zona en la que analogReadMilliVolts() (corregida con la calibración
+  // eFuse del chip) es bastante lineal. Se promedian varias muestras porque
+  // la impedancia del divisor (~78k) hace ruidosa cada lectura individual.
+  // La calibración de 2 puntos anterior era para el divisor 100k/100k y ya
+  // no aplica: BAT_CAL_SLOPE/OFFSET quedan neutros hasta recalibrar contra
+  // un multímetro con este divisor.
+  const float BAT_DIV_RATIO  = (390.0f + 100.0f) / 100.0f;
+  const float BAT_CAL_SLOPE  = 1.0f;
+  const float BAT_CAL_OFFSET = 0.0f;
 
-  // El ADC del ESP32 (atenuación 11dB) no es lineal en este rango: la
-  // fórmula teórica (x2) subestima la tensión real de forma consistente.
-  // Calibración de 2 puntos contra multímetro:
-  //   3.70 V real → v_adc 1.67 V (teórico daba 3.34 V)
-  //   4.20 V real → v_adc 1.93 V (teórico daba 3.86 V)
-  const float BAT_CAL_SLOPE  = 1.9231f;
-  const float BAT_CAL_OFFSET = 0.4885f;
-  float voltage = v_adc * BAT_CAL_SLOPE + BAT_CAL_OFFSET;
+  uint32_t mvSum = 0;
+  for (int i = 0; i < 16; i++) mvSum += analogReadMilliVolts(pinBattery);
+  float v_adc = (mvSum / 16.0f) / 1000.0f;
+  float voltage = v_adc * BAT_DIV_RATIO * BAT_CAL_SLOPE + BAT_CAL_OFFSET;
 
   return String(voltage, 2);
 }
@@ -1657,9 +2484,16 @@ void runRainCounter() {
     delayMicroseconds(500);
   }
 
+  sleepRemainingCycle();  // No retorna, entra en deep sleep
+}
+
+// Vuelve a dormir solo lo que falta del período en curso, para que un
+// despertar "extra" (pulso de lluvia por EXT1 o botón "ok" por EXT0) no
+// corra el horario del próximo ciclo por TIMER. Si el período ya venció,
+// ejecuta el ciclo de operación pendiente en vez de reprogramarlo.
+void sleepRemainingCycle() {
   // Calcular tiempo restante
-  TIME_TO_SLEEP = readFile(SPIFFS, "/timesleep.txt").toInt();
-  if (TIME_TO_SLEEP < 60) TIME_TO_SLEEP = 300;
+  TIME_TO_SLEEP = configuredSleepPeriod();
 
   uint64_t now_rtc = getRtcTimeSeconds();
 
@@ -1687,7 +2521,7 @@ void runRainCounter() {
     // indefinidamente — el dispositivo "nunca sale" del ciclo dormir/
     // despertar por lluvia y no llega a reportar. En vez de eso, se
     // ejecuta el ciclo de operación pendiente ahora mismo.
-    Serial.println("[RAIN] Período vencido durante el wake por lluvia: ejecutando ciclo de operación pendiente");
+    Serial.println("[SLEEP] Período vencido durante un wake intermedio: ejecutando ciclo de operación pendiente");
     cycle_active = false;
     init_running();  // No retorna, entra en deep sleep
     return;
@@ -1696,12 +2530,14 @@ void runRainCounter() {
   remaining = TIME_TO_SLEEP - elapsed;
   if (remaining < 10) remaining = 10;
 
-  Serial.printf("[RAIN] Restante: %d seg (%d min)\n", remaining, remaining / 60);
+  Serial.printf("[SLEEP] Restante: %d seg (%d min)\n", remaining, remaining / 60);
 
-  // ===== APAGAR TODO (MOSFET canal P, HIGH=OFF) =====
+  oledPower(false);
+
+  // ===== APAGAR TODO (modem: LOW=OFF / sensores: HIGH=OFF) =====
   gpio_hold_dis((gpio_num_t)MODEM_PWR_PIN);
   pinMode(MODEM_PWR_PIN, OUTPUT);
-  digitalWrite(MODEM_PWR_PIN, HIGH);
+  digitalWrite(MODEM_PWR_PIN, MODEM_PWR_OFF);
   gpio_hold_en((gpio_num_t)MODEM_PWR_PIN);
 
   // RX2/TX2 a LOW: evita retroalimentar el SIM800 por los pines UART
@@ -1717,10 +2553,7 @@ void runRainCounter() {
   gpio_deep_sleep_hold_en();
 
   // Wake ups
-  esp_sleep_enable_timer_wakeup((uint64_t)remaining * uS_TO_S_FACTOR);
-  if (A_PR) {
-    esp_sleep_enable_ext1_wakeup(RAINCOUNT_MASK, ESP_EXT1_WAKEUP_ALL_LOW);
-  }
+  armWakeSources((uint64_t)remaining);
 
   Serial.println("[SLEEP] Volviendo a deep sleep...\n");
   Serial.flush();
@@ -1737,12 +2570,15 @@ void runRainCounter() {
 #define DHT22_HUM_MIN 0.0f
 #define DHT22_HUM_MAX 100.0f
 
-void readDHT22(float &temperature, float &humidity, bool &success) {
+// force = true: la librería DHT devuelve el resultado anterior si se la
+// llama antes de 2 s; forzar la trama permite muestrear más seguido
+// (readHumidity() reutiliza la misma trama que acaba de leer readTemperature()).
+void readDHT22(float &temperature, float &humidity, bool &success, bool force) {
   success = false;
   temperature = -999;
   humidity = -999;
 
-  float t = dht.readTemperature();
+  float t = dht.readTemperature(false, force);
   float h = dht.readHumidity();
 
   if (isnan(t) || isnan(h)) {
@@ -1854,9 +2690,98 @@ float WindVelocity() {
   float speed = counter * (WIND_SPEED_PER_PULSE / 3.0);
   if (speed > MAX_WIND_SPEED_MS) {
     Serial.printf("[WIND] Lectura descartada por implausible: %.1f m/s (ruido del sensor Hall)\n", speed);
-    speed = 0;
+    return NAN;
   }
   return speed;
+}
+
+// Calibración del anemómetro (túnel de viento). La recta tiene ordenada
+// al origen 0.53 m/s: aplicada a 0 pulsos (copas quietas o sensor
+// desconectado) reportaba 0.5 m/s de viento inexistente. Sin pulsos = 0.
+float windCal(float raw) {
+  return raw > 0 ? 0.6448f * raw + 0.5343f : 0.0f;
+}
+
+/* ---------- Muestreo múltiple (modo operación) ---------- */
+#define TH_SAMPLES            3
+#define TH_INTERVAL_MS        1100   // lectura forzada (el DHT21 nominal es 2 s; ver readDHT22())
+#define WIND_SAMPLES          2      // ventanas de velocidad + muestras de dirección
+#define RS485_SAMPLES         2
+#define WD_MAX_SPREAD_DEG     36.0f  // 10 % de 360°: dispersión máxima entre las muestras
+#define WD_EXTRA_SAMPLES      6      // muestras extra si las 3 primeras no son estables
+#define WD_EXTRA_INTERVAL_MS  500
+
+// Diferencia angular mínima entre dos rumbos (0..180), considerando el
+// salto 359° -> 0°: 350° y 10° están a 20°, no a 340°.
+float angleDiff(float a, float b) {
+  float d = fabsf(fmodf(a - b, 360.0f));
+  return d > 180.0f ? 360.0f - d : d;
+}
+
+// Promedio circular (vectorial): suma de vectores unitarios y atan2.
+// El promedio aritmético de 350° y 10° daría 180° (opuesto); el vectorial
+// da 0°.
+float circularMean(const float *deg, int n) {
+  float sx = 0, sy = 0;
+  for (int i = 0; i < n; i++) {
+    float r = deg[i] * DEG_TO_RAD;
+    sx += cosf(r);
+    sy += sinf(r);
+  }
+  float m = atan2f(sy, sx) * RAD_TO_DEG;
+  if (m < 0) m += 360.0f;
+  return m >= 359.95f ? 0.0f : m;
+}
+
+// Mayor diferencia angular entre cualquier par de muestras
+float angularSpread(const float *deg, int n) {
+  float maxD = 0;
+  for (int i = 0; i < n; i++)
+    for (int j = i + 1; j < n; j++) maxD = max(maxD, angleDiff(deg[i], deg[j]));
+  return maxD;
+}
+
+// Viento: WIND_SAMPLES ventanas de 3 s de velocidad (cada una calibrada
+// con windCal() y luego promediadas, así una ventana sin pulsos aporta 0
+// y no la ordenada al origen) y una muestra de dirección al final de cada
+// ventana. Si las direcciones se dispersan más de WD_MAX_SPREAD_DEG se
+// toman muestras extra y se usan las WIND_SAMPLES últimas consecutivas
+// que cumplan; si nunca se estabiliza (viento
+// racheado/variable) se reporta el promedio circular de todas las muestras,
+// que sigue siendo un rumbo coherente aunque menos representativo.
+void readWindAveraged(float &speed, bool &speedOk, float &dir, bool &dirStable) {
+  float sum = 0;
+  int nSpeed = 0;
+  float dirs[WIND_SAMPLES + WD_EXTRA_SAMPLES];
+  int nDir = 0;
+
+  for (int i = 0; i < WIND_SAMPLES; i++) {
+    float v = WindVelocity();
+    dirs[nDir++] = WindDirection();
+    if (!isnan(v)) { v = windCal(v); sum += v; nSpeed++; }
+    Serial.printf("[WIND] Muestra %d: vel=%s dir=%.1f°\n", i + 1,
+                  isnan(v) ? "descartada" : String(v, 2).c_str(), dirs[nDir - 1]);
+  }
+  speedOk = nSpeed > 0;
+  speed = speedOk ? sum / nSpeed : 0;
+
+  float spread = angularSpread(dirs, WIND_SAMPLES);
+  dirStable = spread <= WD_MAX_SPREAD_DEG;
+  while (!dirStable && nDir < WIND_SAMPLES + WD_EXTRA_SAMPLES) {
+    delay(WD_EXTRA_INTERVAL_MS);
+    dirs[nDir++] = WindDirection();
+    spread = angularSpread(&dirs[nDir - WIND_SAMPLES], WIND_SAMPLES);
+    dirStable = spread <= WD_MAX_SPREAD_DEG;
+  }
+
+  if (dirStable) {
+    dir = circularMean(&dirs[nDir - WIND_SAMPLES], WIND_SAMPLES);
+    Serial.printf("[WIND] Dirección estable (dispersión %.1f°): %.1f°\n", spread, dir);
+  } else {
+    dir = circularMean(dirs, nDir);
+    Serial.printf("[WIND] Dirección variable (%d muestras, dispersión >%.0f°): promedio vectorial %.1f°\n",
+                  nDir, WD_MAX_SPREAD_DEG, dir);
+  }
 }
 
 /* ====================== SIM800 FUNCTIONS ======================== */
@@ -1884,17 +2809,75 @@ void modemLinesOff() {
   gpio_hold_en((gpio_num_t)PIN_RX2);
 }
 
+// Enciende sim_control (modem + 12V RS485) con arranque suave: pulsos de
+// ancho creciente (curva cuadrática, los primeros de ~2 µs) cargan los
+// condensadores por escalones en vez de con un único pico de corriente.
+// El MOSFET se apaga despacio (gate con pull-up de 100k), así que cada
+// pulso conduce algo más que su ancho nominal; aun así el pico queda
+// muy por debajo del encendido directo.
+void modemRailOn() {
+  gpio_hold_dis((gpio_num_t)MODEM_PWR_PIN);
+#if MODEM_SOFTSTART_MS > 0
+  const int steps = 40;
+  ledcSetup(MODEM_SOFTSTART_CH, MODEM_SOFTSTART_FREQ, 10);
+  ledcAttachPin(MODEM_PWR_PIN, MODEM_SOFTSTART_CH);
+  for (int i = 1; i <= steps; i++) {
+    ledcWrite(MODEM_SOFTSTART_CH, (uint32_t)(1023UL * i * i / (steps * steps)));
+    delay(MODEM_SOFTSTART_MS / steps);
+  }
+  // Fijar el nivel del registro GPIO antes de soltar el LEDC: así no hay
+  // un instante en LOW al volver a modo GPIO.
+  digitalWrite(MODEM_PWR_PIN, MODEM_PWR_ON);
+  ledcDetachPin(MODEM_PWR_PIN);
+#endif
+  pinMode(MODEM_PWR_PIN, OUTPUT);
+  digitalWrite(MODEM_PWR_PIN, MODEM_PWR_ON);
+}
+
+void modemStepSet(const char *step) {
+  strlcpy(modemStep, step, sizeof(modemStep));
+  modemStepMagic = step[0] ? MODEM_STEP_MAGIC : 0;
+}
+
+#if MODEM_BROWNOUT_RIDE_THROUGH
+static uint32_t savedBrownoutReg = 0;
+#endif
+
+void modemBrownoutRideThrough(bool enable) {
+#if MODEM_BROWNOUT_RIDE_THROUGH
+  if (enable) {
+    if (!savedBrownoutReg) savedBrownoutReg = READ_PERI_REG(RTC_CNTL_BROWN_OUT_REG);
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  } else if (savedBrownoutReg) {
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, savedBrownoutReg);
+    savedBrownoutReg = 0;
+  }
+#endif
+}
+
+// Llamar tras modem.init(): fija la banda si MODEM_BAND no está vacío.
+void modemApplyBand() {
+  if (strlen(MODEM_BAND) == 0) return;
+  modem.sendAT("+CBAND=\"" MODEM_BAND "\"");
+  bool ok = modem.waitResponse(2000L) == 1;
+  Serial.printf("[MODEM] Banda %s: %s\n", MODEM_BAND, ok ? "OK" : "rechazada");
+}
+
 void modemPowerOn() {
   Serial.println("[MODEM] Encendiendo SIM800...");
+  modemStepSet("Encendido");
+  modemBrownoutRideThrough(true);
 
   // Liberar el hold LOW de RX2/TX2 antes de que begin() los reconfigure
   // como pines UART, si no, el periférico no puede tomar control de ellos.
+  // RX2 pasa a entrada ya: durante los 3 s de arranque el TX del SIM800
+  // queda en reposo (HIGH) y no debe pelear contra un LOW forzado.
   gpio_hold_dis((gpio_num_t)PIN_TX2);
   gpio_hold_dis((gpio_num_t)PIN_RX2);
+  pinMode(PIN_RX2, INPUT);
 
-  gpio_hold_dis((gpio_num_t)MODEM_PWR_PIN);
-  pinMode(MODEM_PWR_PIN, OUTPUT);
-  digitalWrite(MODEM_PWR_PIN, LOW);  // MOSFET canal P: LOW = ON
+  modemPoweredOn = true;  // antes de la espera: ver rs485PowerOff()
+  modemRailOn();
   delay(3000);  // esperar arranque del SIM800
 
   SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX2, PIN_TX2);
@@ -1921,10 +2904,12 @@ void modemPowerOff() {
 
   gpio_hold_dis((gpio_num_t)MODEM_PWR_PIN);
   pinMode(MODEM_PWR_PIN, OUTPUT);
-  digitalWrite(MODEM_PWR_PIN, HIGH);  // MOSFET canal P: HIGH = OFF
+  digitalWrite(MODEM_PWR_PIN, MODEM_PWR_OFF);
   gpio_hold_en((gpio_num_t)MODEM_PWR_PIN);
 
   modemPoweredOn = false;
+  modemBrownoutRideThrough(false);
+  modemStepSet("");
 
   Serial.println("[MODEM] SIM800 apagado");
 }
@@ -1933,6 +2918,179 @@ void modemRestart() {
   modemPowerOff();
   delay(1000);
   modemPowerOn();
+}
+
+/* ====================== RS485 / MODBUS RTU ======================== */
+// El esquemático nombra las líneas "TXD"/"RXD" sin dejar claro si es desde
+// el lado del ESP32 o del módulo. Si el sensor no responde con la
+// orientación actual se prueba la contraria, y se recuerda la que funcionó
+// (memoria RTC) para los ciclos siguientes.
+RTC_DATA_ATTR bool rs485Swapped = false;
+volatile bool rs485Busy = false;  // /lognow (hilo async) vs updateSensCache() (loop)
+
+struct Rs485Data {
+  float soilT = 0, soilH = 0, ph = 0;
+  int ec = 0;
+  int rad = 0;
+};
+
+// CRC-16/MODBUS (polinomio 0xA001, inicial 0xFFFF). En la trama va el byte
+// bajo primero.
+uint16_t modbusCRC16(const uint8_t *buf, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t pos = 0; pos < len; pos++) {
+    crc ^= buf[pos];
+    for (int i = 0; i < 8; i++) {
+      crc = (crc & 0x0001) ? (crc >> 1) ^ 0xA001 : (crc >> 1);
+    }
+  }
+  return crc;
+}
+
+// Función 0x03 (Read Holding Registers). Valida dirección, función, número
+// de bytes y CRC de la respuesta antes de aceptarla.
+bool modbusReadRegs(uint32_t baud, uint8_t addr, uint16_t reg, uint16_t count, uint16_t *out) {
+  if (count == 0 || count > 8) return false;
+
+  uint8_t req[8] = {addr, 0x03, (uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF),
+                    (uint8_t)(count >> 8), (uint8_t)(count & 0xFF), 0, 0};
+  uint16_t crc = modbusCRC16(req, 6);
+  req[6] = crc & 0xFF;
+  req[7] = crc >> 8;
+
+  const size_t respLen = 5 + 2 * count;
+  uint8_t resp[5 + 2 * 8];
+
+  for (int attempt = 0; attempt < 2 * RS485_RETRIES; attempt++) {
+    if (attempt == RS485_RETRIES) {
+      rs485Swapped = !rs485Swapped;
+      Serial.printf("[RS485] Sin respuesta, probando TX/RX invertidos (TX=%d RX=%d)\n",
+                    rs485Swapped ? RS485_RX_PIN : RS485_TX_PIN,
+                    rs485Swapped ? RS485_TX_PIN : RS485_RX_PIN);
+    }
+    int txPin = rs485Swapped ? RS485_RX_PIN : RS485_TX_PIN;
+    int rxPin = rs485Swapped ? RS485_TX_PIN : RS485_RX_PIN;
+
+    Serial1.begin(baud, SERIAL_8N1, rxPin, txPin);
+    while (Serial1.available()) Serial1.read();
+    Serial1.write(req, sizeof(req));
+    Serial1.flush();
+
+    // Se descarta lo que llegue antes de la dirección del esclavo (basura
+    // del arranque del transceptor).
+    size_t n = 0;
+    unsigned long t0 = millis();
+    while (n < respLen && millis() - t0 < RS485_TIMEOUT_MS) {
+      if (!Serial1.available()) { delay(1); continue; }
+      uint8_t b = Serial1.read();
+      if (n == 0 && b != addr) continue;
+      resp[n++] = b;
+    }
+    Serial1.end();
+    // Sin UART, pines en alta impedancia: no alimentar el módulo por sus
+    // entradas cuando se corte v_sensor.
+    pinMode(RS485_TX_PIN, INPUT);
+    pinMode(RS485_RX_PIN, INPUT);
+
+    if (n == respLen && resp[1] == 0x03 && resp[2] == 2 * count &&
+        modbusCRC16(resp, respLen - 2) == (uint16_t)(resp[respLen - 2] | (resp[respLen - 1] << 8))) {
+      for (uint16_t i = 0; i < count; i++) {
+        out[i] = (uint16_t)(resp[3 + 2 * i] << 8) | resp[4 + 2 * i];
+      }
+      return true;
+    }
+    Serial.printf("[RS485] Intento %d fallido (%u/%u bytes)\n", attempt + 1, (unsigned)n, (unsigned)respLen);
+    delay(100);
+  }
+  return false;
+}
+
+// Energiza el 12V del sensor (sim_control). Devuelve true si este llamado
+// lo encendió y por tanto debe apagarlo; si el modem ya estaba encendido
+// (p.ej. /ltetest en curso) no se toca.
+bool rs485PowerOn() {
+  if (modemPoweredOn) return false;
+  // El SIM800 arranca a la par: RX2 como entrada para que su TX en reposo
+  // (HIGH) no pelee contra el LOW forzado por modemLinesOff().
+  gpio_hold_dis((gpio_num_t)PIN_RX2);
+  pinMode(PIN_RX2, INPUT);
+  modemRailOn();
+  return true;
+}
+
+void rs485PowerOff(bool owned) {
+  // Si mientras tanto se encendió el modem (/ltetest corre en otro hilo),
+  // el riel ya es suyo: no cortarlo.
+  if (!owned || modemPoweredOn) return;
+  digitalWrite(MODEM_PWR_PIN, MODEM_PWR_OFF);
+  gpio_hold_en((gpio_num_t)MODEM_PWR_PIN);
+  modemLinesOff();
+}
+
+// Lee el sensor elegido en rs485Type. Requiere v_sensor encendido (módulo
+// TTL-RS485).
+bool readRS485(Rs485Data &d) {
+  if (rs485Type == "NONE" || rs485Busy) return false;
+  rs485Busy = true;
+
+  bool owned = rs485PowerOn();
+  if (owned) delay(RS485_WARMUP_MS);
+
+  uint16_t r[4];
+  bool ok = false;
+  if (rs485Type == "SOIL") {
+    // RS485_SAMPLES lecturas (300 ms entre ellas), se promedian las válidas
+    float sH = 0, sT = 0, sPh = 0;
+    uint32_t sEc = 0;
+    int n = 0;
+    for (int i = 0; i < RS485_SAMPLES; i++) {
+      if (i > 0) delay(300);
+      if (modbusReadRegs(9600, RS485_SLAVE_ADDR, 0x0000, 4, r)) {
+        sH  += r[0] / 10.0f;
+        sT  += (int16_t)r[1] / 10.0f;  // con signo: bajo cero en complemento a 2
+        sEc += r[2];
+        sPh += r[3] / 10.0f;
+        n++;
+        Serial.printf("[RS485] Suelo muestra %d: T=%.1f H=%.1f EC=%u pH=%.1f\n",
+                      n, (int16_t)r[1] / 10.0f, r[0] / 10.0f, r[2], r[3] / 10.0f);
+      } else if (n == 0) {
+        break;  // ya agotó sus reintentos y la inversión TX/RX: sensor ausente
+      }
+    }
+    ok = n > 0;
+    if (ok) {
+      d.soilH = sH / n;
+      d.soilT = sT / n;
+      d.ec    = (int)((sEc + n / 2) / n);
+      d.ph    = sPh / n;
+      Serial.printf("[RS485] Suelo promedio (%d/%d): T=%.1f°C H=%.1f%% EC=%d uS/cm pH=%.1f\n",
+                    n, RS485_SAMPLES, d.soilT, d.soilH, d.ec, d.ph);
+    }
+  } else if (rs485Type == "RAD") {
+    // RS485_SAMPLES lecturas (300 ms entre ellas), se promedian las válidas
+    uint32_t sum = 0;
+    int n = 0;
+    for (int i = 0; i < RS485_SAMPLES; i++) {
+      if (i > 0) delay(300);
+      if (modbusReadRegs(4800, RS485_SLAVE_ADDR, 0x0000, 1, r)) {
+        sum += r[0];
+        n++;
+        Serial.printf("[RS485] Radiación muestra %d: %u W/m2\n", n, r[0]);
+      } else if (n == 0) {
+        break;  // ya agotó sus reintentos y la inversión TX/RX: sensor ausente
+      }
+    }
+    ok = n > 0;
+    if (ok) {
+      d.rad = (int)((sum + n / 2) / n);
+      Serial.printf("[RS485] Radiación promedio (%d/%d): %d W/m2\n", n, RS485_SAMPLES, d.rad);
+    }
+  }
+  if (!ok) Serial.println("[RS485] Sensor sin respuesta");
+
+  rs485PowerOff(owned);
+  rs485Busy = false;
+  return ok;
 }
 
 /* ====================== MQTT CALLBACK ======================== */
@@ -1973,6 +3131,11 @@ void callback(char *topic, byte *payload, unsigned int length) {
   if (docIn.containsKey("A_WS"))      A_WS          = docIn["A_WS"].as<bool>();
   if (docIn.containsKey("A_PR"))      A_PR          = docIn["A_PR"].as<bool>();
   if (docIn.containsKey("dirSensor")) dirSensorType = docIn["dirSensor"].as<String>() == "AS5600" ? "AS5600" : "MT6701";
+  if (docIn.containsKey("oled"))      oledOpEnabled = docIn["oled"].as<bool>();
+  if (docIn.containsKey("rs485")) {
+    String v = docIn["rs485"].as<String>();
+    rs485Type = (v == "SOIL" || v == "RAD") ? v : "NONE";
+  }
 
   saveSetting(status ? "1" : "0",         "/status.txt");
   saveSetting(String((int)TIME_TO_SLEEP), "/timesleep.txt");
@@ -1980,9 +3143,11 @@ void callback(char *topic, byte *payload, unsigned int length) {
   saveSetting(A_WS ? "1" : "0",          "/A_WS.txt");
   saveSetting(A_PR ? "1" : "0",          "/A_PR.txt");
   saveSetting(dirSensorType,             "/dirSensor.txt");
+  saveSetting(oledOpEnabled ? "1" : "0", "/oledOp.txt");
+  saveSetting(rs485Type,                 "/rs485.txt");
 
-  Serial.printf("[CONFIG] OK status=%d sleep=%llu seg (%llu min) TH=%d WS=%d PR=%d dirSensor=%s\n",
-                status, TIME_TO_SLEEP, TIME_TO_SLEEP / 60, A_TH, A_WS, A_PR, dirSensorType.c_str());
+  Serial.printf("[CONFIG] OK status=%d sleep=%llu seg (%llu min) TH=%d WS=%d PR=%d dirSensor=%s rs485=%s\n",
+                status, TIME_TO_SLEEP, TIME_TO_SLEEP / 60, A_TH, A_WS, A_PR, dirSensorType.c_str(), rs485Type.c_str());
 
   configReceivedFlag = true;
 }
@@ -2048,7 +3213,8 @@ void wakeup_reason() {
 
   switch (wakeup_reason) {
     case ESP_SLEEP_WAKEUP_EXT0:
-      Serial.println("[WAKEUP] External 0");
+      Serial.println("[WAKEUP] Botón ok (EXT0) - consulta de estado");
+      runStatusViewer();  // No retorna, entra en deep sleep
       break;
 
     case ESP_SLEEP_WAKEUP_EXT1:
@@ -2094,10 +3260,12 @@ String readSensors() {
   delay(50);
   initDS3231();
 
-  DynamicJsonDocument docOut(384);
+  // Con los campos RS485 el JSON ensamblado ronda ~400 bytes de pool
+  DynamicJsonDocument docOut(640);
   docOut["type"] = "weatherStationData";
   docOut["mac"] = macA();
   docOut["conn"] = connectionType;
+  docOut["BO"] = readFile(SPIFFS, "/brownouts.txt").toInt();  // brownouts acumulados (diagnóstico de alimentación)
   docOut["timestamp"] = formatTimestampISO8601(getEpochNow());
 
   // ===== TEMPERATURA Y HUMEDAD (DHT22) =====
@@ -2105,17 +3273,29 @@ String readSensors() {
     Serial.println("[SENSOR] Leyendo DHT22...");
     initDHT22();
 
-    float temp, hum;
-    bool ok;
-    int retries = 0;
-
-    do {
-      readDHT22(temp, hum, ok);
-      if (!ok) {
-        retries++;
-        delay(2000);  // el DHT22 necesita ~2 s entre lecturas
+    // TH_SAMPLES lecturas válidas promediadas (máx. el doble de intentos),
+    // cada TH_INTERVAL_MS con lectura forzada.
+    float temp = 0, hum = 0;
+    int nValid = 0;
+    for (int attempt = 0; attempt < 2 * TH_SAMPLES && nValid < TH_SAMPLES; attempt++) {
+      if (attempt > 0) delay(TH_INTERVAL_MS);
+      float t, h;
+      bool okOne;
+      readDHT22(t, h, okOne, true);
+      if (okOne) {
+        temp += t;
+        hum += h;
+        nValid++;
+        Serial.printf("[DHT22] Muestra %d: T=%.2f H=%.2f\n", nValid, t, h);
+        if (oledReady) oledLog("T/H " + String(nValid) + "/" + String(TH_SAMPLES));
       }
-    } while (!ok && retries < 5);
+    }
+    bool ok = nValid > 0;
+    if (ok) {
+      temp /= nValid;
+      hum /= nValid;
+      if (nValid < TH_SAMPLES) Serial.printf("[DHT22] Solo %d de %d lecturas válidas\n", nValid, TH_SAMPLES);
+    }
 
     if (ok) {
       float tempCal = 0.5480f * temp + 9.0357f;
@@ -2123,26 +3303,34 @@ String readSensors() {
       docOut["T"] = String(tempCal, 2);
       docOut["H"] = String(humCal, 2);
       Serial.printf("[SENSOR] Temp: %.2f°C, Hum: %.2f%%\n", tempCal, humCal);
+      dash.v[DV_T] = String(tempCal, 1) + "C";
+      dashSet(DV_H, String(humCal, 0) + "%");
     } else {
       docOut["T"] = "error";
       docOut["H"] = "error";
       Serial.println("[SENSOR] Error leyendo DHT22");
+      dash.v[DV_T] = "ERR";
+      dashSet(DV_H, "ERR");
     }
   }
 
   // ===== VELOCIDAD Y DIRECCIÓN DEL VIENTO =====
   if (A_WS) {
     Serial.println("[SENSOR] Leyendo viento...");
+    oledLog("viento " + String(WIND_SAMPLES) + "x3s");
 
     initMT6701();
-    float wv = WindVelocity();
-    float wd = WindDirection();
+    float wv, wd;
+    bool wvOk, wdStable;
+    readWindAveraged(wv, wvOk, wd, wdStable);  // ya calibrada (windCal)
 
-    float wvCal = 0.6448f * wv + 0.5343f;
+    float wvCal = wv;
 
-    docOut["WV"] = String(wvCal, 2);
+    docOut["WV"] = wvOk ? String(wvCal, 2) : "error";
     docOut["WD"] = String(wd, 1);
     Serial.printf("[SENSOR] Vel: %.2f m/s, Dir: %.1f°\n", wvCal, wd);
+    dash.v[DV_WV] = wvOk ? String(wvCal, 1) + "m/s" : "ERR";
+    dashSet(DV_WD, dashFmtDir(String(wd, 1)));
   }
 
   // ===== PRECIPITACIÓN =====
@@ -2157,13 +3345,38 @@ String readSensors() {
 
     docOut["RA"] = rain;
     Serial.printf("[SENSOR] Lluvia: %d vaciadas\n", rain);
+    dashSet(DV_RA, String(rain));
     // No se resetea aquí: es un contador acumulado persistente, solo se
     // reinicia manualmente desde la vista de configuración (botón
     // "Reiniciar Contador de Lluvia" -> /get?resetRain=1).
   }
 
-  // Apagar sensores: MOSFET canal P gate HIGH = OFF
-  digitalWrite(SENS_PWR_PIN, HIGH);
+  // ===== SENSOR RS485 (suelo o radiación solar) =====
+  if (rs485Type != "NONE") {
+    Serial.printf("[SENSOR] Leyendo RS485 (%s)...\n", rs485Type.c_str());
+    oledLog("RS485...");
+    Rs485Data rs;
+    bool ok = readRS485(rs);
+    if (rs485Type == "SOIL") {
+      docOut["ST"] = ok ? String(rs.soilT, 1) : "error";
+      docOut["SH"] = ok ? String(rs.soilH, 1) : "error";
+      docOut["EC"] = ok ? String(rs.ec) : "error";
+      docOut["PH"] = ok ? String(rs.ph, 1) : "error";
+      dash.v[DV_ST] = ok ? String(rs.soilT, 1) + "C" : "ERR";
+      dash.v[DV_SH] = ok ? String(rs.soilH, 0) + "%" : "ERR";
+      dash.v[DV_EC] = ok ? String(rs.ec) + "uS" : "ERR";
+      dashSet(DV_PH, ok ? String(rs.ph, 1) : "ERR");
+    } else {
+      docOut["RAD"] = ok ? String(rs.rad) : "error";
+      dashSet(DV_RAD, ok ? String(rs.rad) + "W" : "ERR");
+    }
+    if (!ok) oledLog("RS485 sin respuesta");
+  }
+
+  // Apagar sensores: MOSFET canal P gate HIGH = OFF. Si el OLED está
+  // mostrando el ciclo, v_sensor (que también lo alimenta) sigue encendido
+  // hasta deepSleepSystem().
+  if (!oledReady) digitalWrite(SENS_PWR_PIN, HIGH);
 
   // ===== BATERÍA =====
   String bat = vBat();
@@ -2197,8 +3410,59 @@ void waitForConfig(PubSubClient &mqttClient) {
 }
 
 /* ============MODEM ========== ENVIO LTE (SIM800) ======================== */
+// waitForNetwork() con diagnóstico: cada 3 s registra estado CREG, CSQ y
+// la tensión que ve el SIM800 (AT+CBC), guarda la mínima en lastModemMv y
+// corta antes si el modem deja de responder (se apagó por bajo voltaje en
+// un burst de TX) o la red rechaza el registro. AT+CBC es un promedio: los
+// valles de los bursts de 577 µs son más profundos que lo que muestra.
+bool waitForNetworkMonitored(uint32_t timeoutMs) {
+  uint32_t start = millis();
+  int16_t minMv = lastModemMv > 0 ? lastModemMv : 9999;
+  int noAnswer = 0;
+  while (millis() - start < timeoutMs) {
+    SIM800RegStatus st = modem.getRegistrationStatus();
+    if (st == REG_OK_HOME || st == REG_OK_ROAMING) {
+      if (minMv < 9999) lastModemMv = minMv;
+      return true;
+    }
+    int16_t mv = modem.getBattVoltage();
+    int csq = modem.getSignalQuality();
+    if (mv > 0 && mv < minMv) minMv = mv;
+    Serial.printf("[LTE] t=%2lus CREG=%d CSQ=%d V=%d mV%s\n",
+                  (unsigned long)((millis() - start) / 1000), (int)st, csq, mv,
+                  (mv > 0 && mv < 3500) ? "  <-- BAJA" : "");
+    if (oledReady) {
+      dash.bars = csqToBars(csq);
+      oledLog("CSQ " + String(csq) + " " + String(mv / 1000.0f, 2) + "V");
+    }
+
+    if (st == REG_NO_RESULT && mv <= 0) {
+      if (++noAnswer >= 2) {
+        Serial.println("[ERROR] El SIM800 dejó de responder buscando red (¿se apagó por bajo voltaje?)");
+        setNetStatus("Modem se apago");
+        if (minMv < 9999) lastModemMv = minMv;
+        return false;
+      }
+    } else {
+      noAnswer = 0;
+    }
+    if (st == REG_DENIED) {
+      Serial.println("[ERROR] Registro rechazado por la red (SIM/operador)");
+      setNetStatus("Registro denegado");
+      if (minMv < 9999) lastModemMv = minMv;
+      return false;
+    }
+    delay(3000);
+  }
+  if (minMv < 9999) lastModemMv = minMv;
+  Serial.printf("[LTE] Tensión mínima del SIM800 buscando red: %d mV\n", lastModemMv);
+  return false;
+}
+
 bool sendDataLTE(String jsonData) {
   Serial.println("\n[LTE] Iniciando envío de datos...");
+  dashStep("MODEM", "encendiendo");
+  lastSignal[0] = '\0';
 
   // Encender modem
   modemPowerOn();
@@ -2209,27 +3473,48 @@ bool sendDataLTE(String jsonData) {
     delay(2000);
     if (!modem.init()) {
       Serial.println("[ERROR] Modem no responde");
+      setNetStatus("Modem no responde");
       modemPowerOff();
       return false;
     }
   }
 
   Serial.println("[LTE] Modem: " + modem.getModemInfo());
+  modemApplyBand();
+
+  // Tensión que ve el propio SIM800 en sus pines (AT+CBC): bajo 3.5 V el
+  // módulo avisa UNDER-VOLTAGE y bajo ~3.4 V se apaga solo en plena
+  // transmisión — es el diagnóstico directo de los reinicios.
+  lastModemMv = modem.getBattVoltage();
+  Serial.printf("[LTE] Tensión en el SIM800: %d mV%s\n", lastModemMv,
+                (lastModemMv > 0 && lastModemMv < 3500) ? "  <-- BAJA" : "");
+  if (lastModemMv > 0) oledLog("Vmod " + String(lastModemMv / 1000.0f, 2) + "V");
 
   // Esperar red
   Serial.println("[LTE] Esperando red...");
-  if (!modem.waitForNetwork(60000L)) {
-    Serial.println("[ERROR] Sin cobertura de red");
+  dashStep("RED", "buscando");
+  modemStepSet("Buscando red");
+  if (!waitForNetworkMonitored(60000L)) {
+    Serial.println("[ERROR] Sin registro en la red");
+    if (strcmp(lastNetStatus, "Modem se apago") != 0 && strcmp(lastNetStatus, "Registro denegado") != 0)
+      setNetStatus("Sin cobertura");
     modemPowerOff();
     return false;
   }
 
-  Serial.println("[LTE] Red conectada");
+  int csq = modem.getSignalQuality();
+  snprintf(lastSignal, sizeof(lastSignal), "CSQ %d", csq);
+  Serial.printf("[LTE] Red conectada (CSQ %d)\n", csq);
+  dash.bars = csqToBars(csq);
+  oledLog("OK CSQ " + String(csq));
 
   // Conectar GPRS
   Serial.println("[LTE] Conectando GPRS...");
+  dashStep("GPRS", RUNapn);
+  modemStepSet("GPRS");
   if (!modem.gprsConnect(RUNapn.c_str())) {
     Serial.println("[ERROR] Fallo conexión GPRS");
+    setNetStatus("Fallo GPRS");
     modemPowerOff();
     return false;
   }
@@ -2244,6 +3529,11 @@ bool sendDataLTE(String jsonData) {
   if (topicPub == "") topicPub = "jhpAI/FAUNA/data";
 
   simclient.setServer(serverIP.c_str(), mqtt_port);
+  // El buffer por defecto de PubSubClient (256 B, incluye topic y cabecera)
+  // no alcanza para el JSON con campos RS485: publish() fallaría en silencio.
+  simclient.setBufferSize(768);
+  dashStep("MQTT", serverIP);
+  modemStepSet("MQTT");
 
   // Conectar a MQTT
   int mqttRetries = 0;
@@ -2263,6 +3553,7 @@ bool sendDataLTE(String jsonData) {
 
   if (!simclient.connected()) {
     Serial.println("[ERROR] No se pudo conectar a MQTT");
+    setNetStatus("Fallo MQTT");
     modem.gprsDisconnect();
     modemPowerOff();
     return false;
@@ -2278,6 +3569,8 @@ bool sendDataLTE(String jsonData) {
 
   // Reenviar primero cualquier lectura pendiente de ciclos anteriores sin
   // conexión, en orden cronológico, antes del dato de este ciclo.
+  int pendingLTE = countPendingRecords();
+  dashStep("ENVIO", pendingLTE > 0 ? "+" + String(pendingLTE) + " pend." : "");
   flushPendingData(simclient, topicPub);
 
   // Publicar datos
@@ -2285,15 +3578,21 @@ bool sendDataLTE(String jsonData) {
 
   if (published) {
     Serial.println("[MQTT] Datos publicados correctamente");
+    setNetStatus("Enviado OK (LTE)");
     syncTimeFromInternetLTE();
   } else {
     Serial.println("[ERROR] Fallo al publicar");
+    setNetStatus("Fallo publicacion");
   }
 
   simclient.loop();
   delay(100);
 
-  if (published) waitForConfig(simclient);
+  if (published) {
+    oledLog("esperando config");
+    waitForConfig(simclient);
+    if (configReceivedFlag) oledLog("config OK");
+  }
 
   // Desconectar
   simclient.disconnect();
@@ -2301,6 +3600,7 @@ bool sendDataLTE(String jsonData) {
   modemPowerOff();
 
   Serial.println("[LTE] Desconectado");
+  oledLog("modem off");
 
   return published;
 }
@@ -2312,11 +3612,14 @@ bool sendDataWiFi(String jsonData) {
   RUNssid = readFile(SPIFFS, "/ssidString.txt");
   RUNpass = readFile(SPIFFS, "/passString.txt");
 
+  lastSignal[0] = '\0';
   if (RUNssid == "") {
     Serial.println("[ERROR] SSID no configurado");
+    setNetStatus("SSID no configurado");
     return false;
   }
 
+  dashStep("WIFI", RUNssid);
   WiFi.mode(WIFI_STA);
   WiFi.begin(RUNssid.c_str(), RUNpass.c_str());
 
@@ -2329,12 +3632,16 @@ bool sendDataWiFi(String jsonData) {
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("\n[ERROR] No se pudo conectar a WiFi");
+    setNetStatus("Sin WiFi");
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     return false;
   }
 
   Serial.println("\n[WIFI] Conectado: " + WiFi.localIP().toString());
+  snprintf(lastSignal, sizeof(lastSignal), "%d dBm", (int)WiFi.RSSI());
+  dash.bars = rssiToBars(WiFi.RSSI());
+  oledLog(WiFi.localIP().toString());
 
   // Configurar MQTT
   String serverIP = readFile(SPIFFS, "/server.txt");
@@ -2344,6 +3651,9 @@ bool sendDataWiFi(String jsonData) {
   if (topicPub == "") topicPub = "jhpAI/FAUNA/data";
 
   wificlient.setServer(serverIP.c_str(), mqtt_port);
+  // Ver nota en sendDataLTE(): buffer por defecto de 256 B insuficiente.
+  wificlient.setBufferSize(768);
+  dashStep("MQTT", serverIP);
 
   // Conectar a MQTT
   int mqttRetries = 0;
@@ -2363,6 +3673,7 @@ bool sendDataWiFi(String jsonData) {
 
   if (!wificlient.connected()) {
     Serial.println("[ERROR] No se pudo conectar a MQTT");
+    setNetStatus("Fallo MQTT");
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     return false;
@@ -2378,6 +3689,8 @@ bool sendDataWiFi(String jsonData) {
 
   // Reenviar primero cualquier lectura pendiente de ciclos anteriores sin
   // conexión, en orden cronológico, antes del dato de este ciclo.
+  int pendingWiFi = countPendingRecords();
+  dashStep("ENVIO", pendingWiFi > 0 ? "+" + String(pendingWiFi) + " pend." : "");
   flushPendingData(wificlient, topicPub);
 
   // Publicar datos
@@ -2385,15 +3698,21 @@ bool sendDataWiFi(String jsonData) {
 
   if (published) {
     Serial.println("[MQTT] Datos publicados correctamente");
+    setNetStatus("Enviado OK (WiFi)");
     syncTimeFromInternetWiFi();
   } else {
     Serial.println("[ERROR] Fallo al publicar");
+    setNetStatus("Fallo publicacion");
   }
 
   wificlient.loop();
   delay(100);
 
-  if (published) waitForConfig(wificlient);
+  if (published) {
+    oledLog("esperando config");
+    waitForConfig(wificlient);
+    if (configReceivedFlag) oledLog("config OK");
+  }
 
   // Desconectar
   wificlient.disconnect();
@@ -2401,8 +3720,35 @@ bool sendDataWiFi(String jsonData) {
   WiFi.mode(WIFI_OFF);
 
   Serial.println("[WIFI] Desconectado");
+  oledLog("wifi off");
 
   return published;
+}
+
+/* ====================== POLÍTICA DE ENVÍO / ENERGÍA ======================== */
+// Devuelve "" si este ciclo debe intentar el envío, o el motivo (corto, se
+// muestra en el OLED) para omitirlo. Un ciclo omitido no pierde datos: la
+// lectura ya está en la SD y queda en /pending.jsonl para reenviarse.
+String networkSkipReason() {
+  // Tras un reset por brownout, reintentar enseguida reproduce el mismo
+  // hundimiento de VCC: bucle de reinicios que vacía la batería.
+  if (brownoutBoot) return "Brownout: sin envio";
+
+  bool batValid = cycleBatV >= BAT_VALID_MIN_V;
+  if (connectionType == "LTE" && batValid && cycleBatV < BAT_MODEM_MIN_V) {
+    return "Bat baja " + String(cycleBatV, 2) + "V";
+  }
+
+  // Backoff exponencial: tras N fallos seguidos (sin cobertura, AP caído,
+  // brownouts) intentar cada 2, 4, 8 ciclos en vez de gastar 60+ s de
+  // modem en cada uno.
+  if (netFailStreak >= 2) {
+    uint32_t every = 1UL << min(netFailStreak - 1, 3);
+    if (every > NET_BACKOFF_MAX_SKIP) every = NET_BACKOFF_MAX_SKIP;
+    uint32_t phase = opCycleCount % every;
+    if (phase != 0) return "Reintento en " + String(every - phase) + " cic";
+  }
+  return "";
 }
 
 /* ====================== INIT RUNNING ======================== */
@@ -2435,23 +3781,56 @@ void init_running() {
     }
 
     readConfig();
+    opCycleCount++;
+
+    // 80 MHz basta para sensores, SD, WiFi y el UART del modem, y ahorra
+    // ~20-30 mA durante todo el ciclo (sobre todo los segundos con el modem).
+    Serial.flush();  // cambiar la frecuencia con bytes en el FIFO del UART los corrompe
+    setCpuFrequencyMhz(80);
+
+    // OLED del ciclo: si está habilitado (/oledOp.txt) o ya activo (ciclo
+    // manual desde la consulta de estado). Mantiene v_sensor encendido
+    // durante todo el ciclo, no solo durante la lectura de sensores.
+    if (oledOpEnabled || oledReady) {
+      sensorsRailOn();
+      Wire.begin(I2C_SDA, I2C_SCL);
+      if (oledInit()) {
+        dashBegin("OPER", dashStepsFor(connectionType));
+        dashStep("SENSORES");
+      }
+    }
 
     String sensorData = readSensors();
+    strlcpy(lastDataJson, sensorData.c_str(), sizeof(lastDataJson));
 
     // Respaldo local en la SD, independientemente de si el envío MQTT funciona
     // (o si no hay envío en absoluto, modo DATALOGER). Usa la hora ancla
     // real-time cargada de /settime (ver logToSD()/getEpochNow()), no
     // depende de tener red disponible en este ciclo.
     logToSD(sensorData);
+    dashStep("SD", sdReady ? "registrado" : "no detectada");
+
+    // Batería en reposo (modem apagado, sin carga de RF): decide si el modem
+    // puede encenderse sin tirar el sistema y si hay que alargar el sleep.
+    cycleBatV = vBat().toFloat();
+    if (cycleBatV >= BAT_VALID_MIN_V && cycleBatV < BAT_MODEM_MIN_V) {
+      oledLog("bat baja " + String(cycleBatV, 2) + "V");
+    }
 
     if (connectionType == "DATALOGER") {
       // Modo solo-registro local: no se enciende WiFi ni el modem, no hay
       // nada que enviar ni encolar como pendiente — el dato ya quedó en la SD.
       Serial.println("[MODE] Dataloger local (sin envío, solo respaldo en SD)");
+      lastSignal[0] = '\0';
+      setNetStatus("Solo SD (datalogger)");
     } else {
       bool success = false;
+      String skip = networkSkipReason();
 
-      if (connectionType == "WIFI") {
+      if (skip != "") {
+        Serial.println("[POWER] Envío omitido este ciclo: " + skip);
+        setNetStatus(skip.c_str());
+      } else if (connectionType == "WIFI") {
         Serial.println("[MODE] WiFi");
         success = sendDataWiFi(sensorData);
       } else if (connectionType == "LTE") {
@@ -2459,12 +3838,29 @@ void init_running() {
         success = sendDataLTE(sensorData);
       }
 
+      // Solo los intentos reales cuentan para la racha (no los omitidos)
+      if (skip == "") {
+        netFailStreak = success ? 0 : netFailStreak + 1;
+        saveSetting(String(netFailStreak), "/netFail.txt");
+      }
+
+      lastCycleSent = success;
       if (success) {
         Serial.println("[OK] Datos enviados correctamente");
       } else {
         Serial.println("[ERROR] Fallo al enviar datos");
         appendPendingRecord(sensorData);
       }
+    }
+
+    if (oledReady) {
+      int pending = countPendingRecords();
+      dash.batV = cycleBatV;
+      String sleepTxt = "zzz " + String((unsigned long)(configuredSleepPeriod() / 60)) + "min";
+      if (connectionType == "DATALOGER") dashFinish("SOLO SD", sleepTxt);
+      else dashFinish(lastCycleSent ? "ENVIADO" : "GUARDADO",
+                      (pending > 0 ? "pend " + String(pending) + " " : "") + sleepTxt);
+      delay(3000);  // dar tiempo a leer el resumen (se descuenta del sleep)
     }
 
     // Entrar en deep sleep
@@ -2487,6 +3883,11 @@ void readConfig() {
   A_WS = (aws == "1");
   A_PR = (apr == "1");
   dirSensorType = (dirSensor == "AS5600") ? "AS5600" : "MT6701";
+  oledOpEnabled = (readFile(SPIFFS, "/oledOp.txt") != "0");
+  String rs485Cfg = readFile(SPIFFS, "/rs485.txt");
+  rs485Type = (rs485Cfg == "SOIL" || rs485Cfg == "RAD") ? rs485Cfg : "NONE";
+
+  netFailStreak = readFile(SPIFFS, "/netFail.txt").toInt();
 
   String apnCfg = readFile(SPIFFS, "/apn.txt");
   RUNapn = (apnCfg == "") ? "claro.pe" : apnCfg;
@@ -2496,6 +3897,8 @@ void readConfig() {
   Serial.printf("A_WS = %s\n", A_WS ? "true" : "false");
   Serial.printf("A_PR = %s\n", A_PR ? "true" : "false");
   Serial.printf("dirSensorType = %s\n", dirSensorType.c_str());
+  Serial.printf("oledOp = %s\n", oledOpEnabled ? "true" : "false");
+  Serial.printf("rs485Type = %s\n", rs485Type.c_str());
   Serial.printf("RUNapn = %s\n\n", RUNapn.c_str());
 }
 
@@ -2610,7 +4013,7 @@ void updateSensCache() {
         Serial.printf("[WIND] Lectura descartada por implausible: %.1f m/s (ruido del sensor Hall)\n", speed);
         speed = 0;
       }
-      sensCache.wvel = String(speed, 1);
+      sensCache.wvel = String(windCal(speed), 1);
     }
     sensCache.wdir = String(WindDirection(), 1);
   } else {
@@ -2677,6 +4080,32 @@ void updateSensCache() {
     sensCache.rainCount = "NA";
   }
 
+  // RS485: lectura bloqueante (~2-3 s, energiza el 12V y con él el SIM800),
+  // así que solo cada 30 s y no en cada vuelta de loop().
+  static unsigned long lastRs485Read = 0;
+  if (rs485Type == "NONE") {
+    sensCache.rsT = sensCache.rsH = sensCache.rsEC = sensCache.rsPH = sensCache.rsRad = "NA";
+    sensCache.rs485 = "NA";
+  } else if (lastRs485Read == 0 || millis() - lastRs485Read >= 30000) {
+    Rs485Data rs;
+    if (readRS485(rs)) {
+      if (rs485Type == "SOIL") {
+        sensCache.rsT  = String(rs.soilT, 1);
+        sensCache.rsH  = String(rs.soilH, 1);
+        sensCache.rsEC = String(rs.ec);
+        sensCache.rsPH = String(rs.ph, 1);
+        sensCache.rs485 = "T " + sensCache.rsT + "°C H " + sensCache.rsH + "% EC " + sensCache.rsEC + " pH " + sensCache.rsPH;
+      } else {
+        sensCache.rsRad = String(rs.rad);
+        sensCache.rs485 = sensCache.rsRad + " W/m²";
+      }
+    } else {
+      sensCache.rsT = sensCache.rsH = sensCache.rsEC = sensCache.rsPH = sensCache.rsRad = "error";
+      sensCache.rs485 = "Sin respuesta";
+    }
+    lastRs485Read = millis();
+  }
+
   sensCache.bat = vBat();
 }
 
@@ -2694,6 +4123,9 @@ void createDefaultConfigs() {
     {"/A_WS.txt", "0"},
     {"/A_PR.txt", "0"},
     {"/dirSensor.txt", "MT6701"},
+    {"/oledOp.txt", "1"},
+    {"/rs485.txt", "NONE"},
+    {"/netFail.txt", "0"},
     {"/connType.txt", "WIFI"},
     {"/apn.txt", "claro.pe"},
     {"/timesleep.txt", "300"},
@@ -2721,6 +4153,21 @@ void createDefaultConfigs() {
   Serial.println("[INIT] Archivos de configuración verificados\n");
 }
 
+/* ================== ARRANQUE TEMPRANO ==================*/
+// GPIO15 (sim_control) es pin de arranque con pull-up interno activo durante
+// el reset: a través de R1/R13 alcanza para saturar Q4/Q5 y el modem + el
+// 12V del RS485 se encienden solos hasta que el firmware fuerce LOW. Este
+// hook del core corre antes que setup() (y antes de Serial.begin + delay),
+// así que acorta ese encendido espurio lo más posible. No lo elimina: los
+// ~250 ms del bootloader quedan fuera del alcance del firmware (ver la
+// recomendación de hardware: pull-down de 4.7k en GPIO15).
+// En un wake desde deep sleep el pin sigue retenido (gpio_hold) en LOW y
+// esto no tiene efecto.
+extern "C" void initVariant() {
+  pinMode(MODEM_PWR_PIN, OUTPUT);
+  digitalWrite(MODEM_PWR_PIN, MODEM_PWR_OFF);
+}
+
 /* ================== MAIN SETUP ==================*/
 void setup() {
   Serial.begin(115200);
@@ -2738,10 +4185,11 @@ void setup() {
   gpio_hold_dis((gpio_num_t)PIN_RX2);
 
   // ===== ASEGURAR MODEM Y SENSORES APAGADOS =====
-  // MOSFET canal P: HIGH = OFF. A diferencia del SIM7000 no se requiere
-  // pulso de PWRKEY: toda la alimentación del módulo se corta con el MOSFET.
+  // Modem: MODEM_PWR_OFF (LOW, por el NPN Q4). Sensores: MOSFET canal P,
+  // HIGH = OFF. No se requiere pulso de PWRKEY: toda la alimentación del
+  // módulo se corta con el MOSFET.
   pinMode(MODEM_PWR_PIN, OUTPUT);
-  digitalWrite(MODEM_PWR_PIN, HIGH);
+  digitalWrite(MODEM_PWR_PIN, MODEM_PWR_OFF);
 
   pinMode(SENS_PWR_PIN, OUTPUT);
   digitalWrite(SENS_PWR_PIN, HIGH);
@@ -2752,6 +4200,19 @@ void setup() {
   pinMode(PIN_RX2, OUTPUT);
   digitalWrite(PIN_TX2, LOW);
   digitalWrite(PIN_RX2, LOW);
+
+  // Motivo del reset: "BROWNOUT" = VCC se hundió por debajo de ~2.43 V en
+  // el ESP32 (típico al transmitir el SIM800 con batería floja o cableado
+  // fino). Sin esta marca el equipo reintentaría el envío de inmediato.
+  esp_reset_reason_t rst = esp_reset_reason();
+  brownoutBoot = (rst == ESP_RST_BROWNOUT);
+  Serial.printf("[BOOT] Motivo de reset: %d%s\n", (int)rst, brownoutBoot ? " (BROWNOUT)" : "");
+  if (rst != ESP_RST_POWERON && rst != ESP_RST_DEEPSLEEP &&
+      modemStepMagic == MODEM_STEP_MAGIC && modemStep[0]) {
+    modemStep[sizeof(modemStep) - 1] = '\0';
+    Serial.printf("[BOOT] El reset ocurrió con el modem en el paso: %s\n", modemStep);
+  }
+  modemStepMagic = 0;
 
   // Montar SPIFFS
   if (!SPIFFS.begin(true)) {
@@ -2801,6 +4262,26 @@ void setup() {
 
   // Leer configuración
   readConfig();
+
+  // Encendido en frío (batería reconectada, botón EN, flasheo por USB):
+  // el operador está presente, probablemente tras corregir la alimentación.
+  // Limpiar el backoff para que este ciclo intente enviar de inmediato en
+  // vez de heredar la racha de fallos/brownouts de antes del corte.
+  if (rst == ESP_RST_POWERON || rst == ESP_RST_EXT || rst == ESP_RST_SW) {
+    if (netFailStreak != 0) {
+      Serial.printf("[POWER] Arranque en frío: backoff reiniciado (racha previa %d)\n", netFailStreak);
+      netFailStreak = 0;
+      saveSetting("0", "/netFail.txt");
+    }
+  }
+
+  if (brownoutBoot) {
+    // Contar el brownout como un envío fallido (alimenta el backoff) y
+    // llevar un total acumulado para diagnóstico remoto (campo "BO").
+    netFailStreak++;
+    saveSetting(String(netFailStreak), "/netFail.txt");
+    saveSetting(String(readFile(SPIFFS, "/brownouts.txt").toInt() + 1), "/brownouts.txt");
+  }
 
   if (A_PR) {
     pinMode(RAINCOUNT, INPUT);
@@ -2852,6 +4333,7 @@ void loop() {
     // updateSensCache() ya no bloquea (viento por interrupción, DHT por temporizador
     // interno): se llama en cada vuelta de loop() para lecturas casi en tiempo real.
     updateSensCache();
+    configOledTask();
 
     delay(20);
     return;
