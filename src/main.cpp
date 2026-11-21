@@ -24,7 +24,7 @@
  *              da la marca de tiempo real; mantiene la hora con su propia batería
  *              de respaldo aunque el equipo pierda alimentación por completo.
  *   DHT      : GPIO4 (DHT22)
- *   Batería  : GPIO34 (ADC), divisor R10=390k / R11=100k.
+ *   Batería  : GPIO34 (ADC), divisor R10=330k / R11=100k.
  *   Botón AP : GPIO36 (modo configuración si está en LOW al arrancar).
  *              Entrada solo-lectura SIN pull interno: requiere resistencia
  *              pull-up EXTERNA a 3.3V; el botón conecta a GND al presionarlo.
@@ -212,13 +212,13 @@ const char gprsPass[] = "";
 // de corriente que hunde VCC y resetea el ESP32 por brownout), se pulsa
 // sim_control por PWM con ciclo útil creciente durante MODEM_SOFTSTART_MS.
 // 0 = desactivado (encendido directo como antes).
-#define MODEM_SOFTSTART_MS   400
+#define MODEM_SOFTSTART_MS   0     // 0 como en PROD (a603f7a): encendido directo
 #define MODEM_SOFTSTART_FREQ 500   // Hz: período de 2 ms
 #define MODEM_SOFTSTART_CH   7     // canal LEDC libre
 
 /* ================== GESTIÓN DE ENERGÍA (BATERÍA) ================== */
 // Umbrales sobre vBat() medido en reposo (modem apagado). DEPENDEN de que
-// vBat() esté calibrado contra un multímetro (ver BAT_CAL_SLOPE/OFFSET).
+// vBat() esté calibrado contra un multímetro (factor batCalFactor, se ajusta desde el portal).
 #define BAT_VALID_MIN_V      2.50f  // por debajo: lectura inválida (sin divisor / alimentación USB) → no se aplica ninguna regla
 #define BAT_MODEM_MIN_V      3.55f  // por debajo: no se enciende el modem (los picos de 2 A tirarían el sistema)
 #define BAT_CRITICAL_V       3.40f  // por debajo: período de sleep × LOW_BAT_SLEEP_FACTOR
@@ -238,6 +238,18 @@ const char gprsPass[] = "";
 // "PCS_MODE" = solo 1900 (Claro Perú usa 1900 y 850 según zona: verificar
 // cobertura antes de forzarla). "" = no tocar la configuración del modem.
 #define MODEM_BAND ""
+
+// Tiempos de estabilización del enlace ESP32 <-> SIM800 antes de
+// modem.init(). Mientras el SIM800 termina de arrancar (RDY, +CFUN, +CPIN,
+// Call Ready, SMS Ready) y hace sus primeros picos de RF, las respuestas
+// llegaban corruptas ("OK" + basura) y TinyGSM daba el init por fallido.
+#define MODEM_BOOT_MS        5000   // arranque con el UART cerrado (PROD: 3000)
+#define MODEM_SYNC_MS       15000   // máx. enviando "AT" hasta el primer OK (autobaud)
+#define MODEM_READY_MS      15000   // máx. esperando "SMS Ready" / silencio de URC
+#define MODEM_QUIET_MS       2000   // silencio en la línea que da por terminado el arranque
+#define MODEM_STABLE_OK         3   // "AT"->"OK" limpios y seguidos exigidos antes del init
+#define MODEM_STABLE_MS     12000   // máx. buscando esos OK seguidos
+#define MODEM_INIT_TRIES        3   // init sin cortar alimentación antes de reiniciar
       // tras fallos seguidos, intentar envío como mucho cada 8 ciclos
 
 #define SENS_PWR_PIN        2    // MOSFET canal P: LOW=ON, HIGH=OFF (ctrl-sensors, D2 en esquemático)
@@ -283,11 +295,37 @@ RTC_DATA_ATTR int16_t lastModemMv = -1;
 #define MODEM_STEP_MAGIC 0x5A11C0DEUL
 RTC_NOINIT_ATTR uint32_t modemStepMagic;
 RTC_NOINIT_ATTR char modemStep[24];   // tensión que mide el propio SIM800 (AT+CBC)
+// Diagnóstico del encendido del modem: ver mdiagFeed()/modemDiagFail().
+struct ModemDiag {
+  float vBat0;       // batería justo antes de encender el modem (V)
+  float vBatMin;     // mínima medida mientras el modem estuvo encendido (V)
+  int8_t rxPre;      // RX con pull-down interno y modem APAGADO: 1 = pull-up externo / retroalimentación
+  int8_t rxOn;       // RX con pull-down, 150 ms después de energizar (antes de abrir el UART)
+  int8_t rxLevel;    // nivel de RX tras los 3 s de arranque: 1 = TX del SIM800 vivo (idle HIGH)
+  int8_t txIdle;     // nivel real del pad TX del ESP32 en reposo: 0 = línea cargada/en corto a GND
+  uint16_t rxBytes;  // bytes recibidos del modem (arranque + pruebas AT)
+  uint32_t atBaud;   // baudrate al que respondió "OK" (0 = a ninguno)
+  uint8_t attempts;  // encendidos en este ciclo (modemRestart() suma uno)
+  int16_t vSimMax;   // máxima tensión reportada por el SIM800 (AT+CBC), mV
+  uint16_t badBytes; // bytes no imprimibles recibidos (errores de trama / ruido en RX)
+  uint8_t hexN;      // primeros bytes crudos recibidos (para ver basura)
+  uint8_t hex[4];
+  char step[12];     // paso en que falló (INIT/RED/GPRS/MQTT/PUBL)
+  char urc[22];      // mensaje relevante del modem (OVER-VOLTAGE..., RDY, CPIN...)
+  char tail[22];     // últimos caracteres imprimibles recibidos
+};
+RTC_DATA_ATTR ModemDiag mdiag;
+// SIM800: VBAT máx. 4.4 V; por encima avisa OVER-VOLTAGE WARNNING y a ~4.5 V
+// se apaga solo (OVER-VOLTAGE POWER DOWN), p.ej. alimentado desde el USB.
+#define SIM800_VMAX_MV 4400
+
+String rstModemStep = "";      // paso del modem en curso si el último reset fue por brownout/WDT
 // Racha de envíos fallidos (en SPIFFS: un reset por brownout puede borrar la
 // memoria RTC, y justamente esos resets son los que hay que contar).
 int netFailStreak = 0;
 bool brownoutBoot = false;
 bool lastCycleSent = false;  // resultado del envío de este ciclo (resumen OLED)   // este arranque viene de un reset por brownout
+float batCalFactor = 1.0f;   // calibración de vBat() (/batCal.txt)
 float cycleBatV = -1;        // batería medida en este ciclo, en reposo
 
 /* Device settings */
@@ -316,7 +354,7 @@ WiFiClient espClient;
 PubSubClient wificlient(espClient);
 
 /* ====================== DEVICE SETTINGS ======================== */
-#define pinBattery        34   // ADC1_CH6, divisor R10=390k / R11=100k
+#define pinBattery        34   // ADC1_CH6, divisor R10=330k / R11=100k
 #define pinWindVelocity   13
 #define pinConfigAP       36
 #define RAINCOUNT         GPIO_NUM_39  // INPUT-ONLY PIN - sin pull interno; la placa trae R8=10k a 3.3V
@@ -528,6 +566,12 @@ input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(1
 <div class="dt" id="dataTableWrap"><div class="ps" style="padding:8px">Sin cargar aún.</div></div>
 </div>
 
+<div class="sc">
+<h3>&#x1F50B; Calibración de batería</h3>
+<div class="ps">Lectura actual: %BAT_NOW% V (factor %BAT_CAL%). Mide la batería con un multímetro en el mismo momento y escribe el valor real; 0 = quitar calibración.</div>
+<form action="/get"><div class="fr"><label>Voltaje real (V)</label><input type="number" step="0.01" min="0" max="6" name="batReal" placeholder="3.95"></div><input type="submit" value="Calibrar"></form>
+</div>
+
 <div class="sc" id="lteCard" style="%LTE_CARD_STYLE%">
 <h3>&#x1F4E1; Diagnóstico LTE (SIM800)</h3>
 <form action="/get"><div class="fr"><label>APN</label><input type="text" name="apn" value="%apn%" placeholder="claro.pe / internet.movistar.pe"></div><input type="submit" value="Guardar"></form>
@@ -581,7 +625,7 @@ function downloadSD(name){window.location.href=name?('/downloadsd?file='+encodeU
 function logNow(){if(busy)return;setBusy(true);var r=document.getElementById('sdResult');r.innerText='Leyendo sensores y guardando... (puede tardar unos segundos)';fetch('/lognow').then(r=>r.json()).then(d=>{r.innerText=d.msg;setBusy(false);loadDataTable();}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;setBusy(false);});}
 function loadSDFileList(){if(busy)return;setBusy(true);var w=document.getElementById('sdFileListWrap');w.innerHTML='<div class="ps" style="padding:8px">Cargando...</div>';fetch('/sdlist').then(r=>r.json()).then(d=>{if(!d.files||d.files.length==0){w.innerHTML='<div class="ps" style="padding:8px">Sin archivos en la SD.</div>';return;}var html='<table><thead><tr><th>Archivo</th><th>Tamaño</th><th></th></tr></thead><tbody>';d.files.forEach(function(f){var kb=(f.size/1024).toFixed(1);html+='<tr><td>'+f.name+'</td><td>'+kb+' KB</td><td><button type="button" class="btn br" style="padding:4px 10px" onclick="downloadSD(\''+f.name+'\')">&#x2B07;</button></td></tr>';});html+='</tbody></table>';w.innerHTML=html;}).catch(e=>{w.innerHTML='<div class="ps" style="padding:8px">Error de comunicación: '+e+'</div>';}).finally(()=>setBusy(false));}
 function loadDataTable(){var w=document.getElementById('dataTableWrap');w.innerHTML='<div class="ps" style="padding:8px">Cargando...</div>';fetch('/viewdata').then(r=>r.text()).then(t=>{var lines=t.split('\n').filter(l=>l.length>0);if(lines.length<2){w.innerHTML='<div class="ps" style="padding:8px">Sin datos registrados aún.</div>';return;}var head=lines[0].split(',');var html='<table><thead><tr>';head.forEach(h=>html+='<th>'+h+'</th>');html+='</tr></thead><tbody>';for(var i=lines.length-1;i>=1;i--){var cols=lines[i].split(',');html+='<tr>';cols.forEach(c=>html+='<td>'+c+'</td>');html+='</tr>';}html+='</tbody></table>';w.innerHTML=html;}).catch(e=>{w.innerHTML='<div class="ps" style="padding:8px">Error de comunicación: '+e+'</div>';});}
-function lteTest(){if(busy)return;setBusy(true);var r=document.getElementById('lteResult');r.innerText='Probando... (enciende el modem, puede tardar hasta 20 s)';fetch('/ltetest').then(r=>r.json()).then(d=>{var lines=[];if(d.modemInfo)lines.push('Modem: '+d.modemInfo);if(d.signal!=null)lines.push('Señal (CSQ): '+d.signal+(d.signal==99?' (desconocida)':''));if(d.simReady!=null)lines.push('SIM lista: '+(d.simReady?'sí':'no'));if(d.networkRegistered!=null)lines.push('Registrado en red: '+(d.networkRegistered?'sí':'no'));if(d.operator)lines.push('Operador: '+d.operator);if(d.gprsConnected!=null)lines.push('GPRS/Internet: '+(d.gprsConnected?'sí':'no'));if(d.ip)lines.push('IP: '+d.ip);lines.push(d.msg||(d.ok?'OK':'Error'));document.getElementById('lteResult').innerHTML=lines.join('<br>');}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;}).finally(()=>setBusy(false));}
+function lteTest(){if(busy)return;setBusy(true);var r=document.getElementById('lteResult');r.innerText='Probando... (enciende y estabiliza el modem, puede tardar 1-2 min)';fetch('/ltetest').then(r=>r.json()).then(d=>{var lines=[];if(d.modemInfo)lines.push('Modem: '+d.modemInfo);if(d.signal!=null)lines.push('Señal (CSQ): '+d.signal+(d.signal==99?' (desconocida)':''));if(d.simReady!=null)lines.push('SIM lista: '+(d.simReady?'sí':'no'));if(d.networkRegistered!=null)lines.push('Registrado en red: '+(d.networkRegistered?'sí':'no'));if(d.operator)lines.push('Operador: '+d.operator);if(d.gprsConnected!=null)lines.push('GPRS/Internet: '+(d.gprsConnected?'sí':'no'));if(d.ip)lines.push('IP: '+d.ip);if(d.vBat0!=null)lines.push('Bateria: '+d.vBat0+' V -> min '+d.vBatMin+' V'+(d.vMod>0?' | SIM800: '+(d.vMod/1000).toFixed(2)+' V':''));if(d.rxLevel!=null)lines.push('RX modem: '+(d.rxLevel==1?'ALTO':d.rxLevel==0?'BAJO (sin energia?)':'--')+', '+d.rxBytes+' bytes, AT: '+d.atBaud);if(d.rxPre!=null)lines.push('RX apagado/encendido/3s: '+d.rxPre+' > '+d.rxOn+' > '+d.rxLevel+(d.rxPre==1?' (alto SIN modem: pull-up externo)':''));if(d.txIdle!=null)lines.push('TX ESP32 en reposo: '+(d.txIdle==1?'alto (OK)':d.txIdle==0?'BAJO (linea en corto/cargada)':'--'));if(d.hex)lines.push('Bytes crudos: '+d.hex);if(d.errBytes)lines.push('Bytes corruptos en RX: '+d.errBytes);if(d.cause)lines.push('Causa probable: '+d.cause);if(d.warning)lines.push('<b>'+d.warning+'</b>');if(d.urc)lines.push('Mensaje modem: '+d.urc);if(d.tail)lines.push('Ultimo RX: '+d.tail);lines.push(d.msg||(d.ok?'OK':'Error'));document.getElementById('lteResult').innerHTML=lines.join('<br>');}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;}).finally(()=>setBusy(false));}
 document.querySelectorAll('form').forEach(f=>{f.onsubmit=function(e){if(this.querySelector('input[name="resetRain"]')&&!confirm('¿Reiniciar el contador de lluvia a 0? Esta acción no se puede deshacer.')){e.preventDefault();return;}if(!this.querySelector('input[name="reset"]')){e.preventDefault();fetch('/get?'+new URLSearchParams(new FormData(this))).then(()=>location.href='/').catch(()=>location.href='/');}}});
 </script>
 </body>
@@ -600,11 +644,21 @@ void deepSleepSystem();
 void setting();
 void setupServerRoutes();
 String vBat();
+float vBatRaw(int samples = 16);
 void runRainCounter();
 void readDHT22(float &temperature, float &humidity, bool &success, bool force = false);
 float WindDirection();
 float WindVelocity();
 void modemPowerOn();
+void mdiagReset();
+String mdiagHexTxt();
+void mdiagPump(uint32_t ms, bool live);
+void mdiagTrackVsim(int16_t mv);
+bool modemStabilize();
+bool modemInitRetries();
+void modemDiagProbeAT();
+const char *modemDiagCause();
+void drawModemDiagPage(const String &footer);
 void modemPowerOff();
 void modemApplyBand();
 void modemRestart();
@@ -743,6 +797,10 @@ String processor(const String& var) {
     return readFile(SPIFFS, "/topicPub.txt");
   } else if (var == "topicSub") {
     return readFile(SPIFFS, "/topicSub.txt");
+  } else if (var == "BAT_NOW") {
+    return vBat();
+  } else if (var == "BAT_CAL") {
+    return String(batCalFactor, 4);
   } else if (var == "apn") {
     String v = readFile(SPIFFS, "/apn.txt");
     return (v == "") ? "claro.pe" : v;
@@ -1396,13 +1454,16 @@ void setupServerRoutes() {
   // Diagnóstico LTE bajo demanda (bloqueante, botón manual): solo tiene
   // sentido si connType=LTE, ya que enciende el modem SIM800 vía MOSFET.
   server.on("/ltetest", HTTP_GET, [](AsyncWebServerRequest *request) {
+    // En modo config init_running() entra a setting() antes de cargar
+    // connectionType: leerlo siempre del archivo, que es la fuente real.
+    connectionType = readFile(SPIFFS, "/connType.txt");
     if (connectionType != "LTE") {
       request->send(400, "application/json", "{\"ok\":false,\"msg\":\"Modo LTE no seleccionado\"}");
       return;
     }
 
     Serial.println("[LTE TEST] Iniciando diagnóstico...");
-    StaticJsonDocument<384> doc;
+    StaticJsonDocument<768> doc;
     doc["ok"] = false;
 
     // Este handler corre en el hilo "async_tcp" (el mismo que atiende TODAS
@@ -1414,14 +1475,36 @@ void setupServerRoutes() {
     // diagnóstico bloqueante y se vuelve a suscribir antes de responder.
     esp_task_wdt_delete(NULL);
 
+    // El OLED lo dibuja configOledTask() en el loop: este handler corre en
+    // otro hilo, así que se silencian los oledLog() del modem (I2C no es
+    // reentrante). El diagnóstico queda en mdiag (vista MODEM) y en el JSON.
+    bool oledWas = oledReady;
+    oledReady = false;
+    mdiagReset();
+    lastModemMv = -1;
+    // Se agrega al JSON en cada respuesta (macro para no repetirlo).
+    #define LTE_TEST_DIAG() do { \
+      doc["vBat0"] = String(mdiag.vBat0, 2); doc["vBatMin"] = String(mdiag.vBatMin, 2); \
+      doc["rxLevel"] = mdiag.rxLevel; doc["rxBytes"] = mdiag.rxBytes; \
+      doc["atBaud"] = mdiag.atBaud ? String(mdiag.atBaud) : String("no"); \
+      doc["rxPre"] = mdiag.rxPre; doc["rxOn"] = mdiag.rxOn; doc["txIdle"] = mdiag.txIdle; doc["hex"] = mdiagHexTxt(); \
+      doc["cause"] = modemDiagCause(); \
+      doc["urc"] = mdiag.urc; doc["tail"] = mdiag.tail; doc["vMod"] = mdiag.vSimMax > 0 ? mdiag.vSimMax : lastModemMv; doc["errBytes"] = mdiag.badBytes; \
+      oledReady = oledWas; } while (0)
+
     modemPowerOn();
 
-    if (!modem.init()) {
+    // Misma secuencia que el ciclo: estabilizar → init (reintentos) → reinicio
+    bool linkOk = modemStabilize();
+    if (!linkOk || !modemInitRetries()) {
       modemRestart();
-      delay(2000);
-      if (!modem.init()) {
-        doc["msg"] = "El modem SIM800 no responde";
+      linkOk = modemStabilize();
+      if (!linkOk || !modemInitRetries()) {
+        modemDiagProbeAT();
+        doc["msg"] = String("El modem SIM800 no responde: ") + modemDiagCause();
+        strlcpy(mdiag.step, "INIT", sizeof(mdiag.step));
         modemPowerOff();
+        LTE_TEST_DIAG();
         esp_task_wdt_add(NULL);
         String response;
         serializeJson(doc, response);
@@ -1432,6 +1515,10 @@ void setupServerRoutes() {
 
     doc["modemInfo"] = modem.getModemInfo();
     modemApplyBand();
+    lastModemMv = modem.getBattVoltage();
+    mdiagTrackVsim(lastModemMv);
+    if (lastModemMv >= SIM800_VMAX_MV)
+      doc["warning"] = "SOBREVOLTAJE en el SIM800: " + String(lastModemMv) + " mV (max 4400). Se apagara solo (OVER-VOLTAGE POWER DOWN).";
 
     int16_t csq = modem.getSignalQuality();
     doc["signal"] = csq;
@@ -1442,7 +1529,9 @@ void setupServerRoutes() {
 
     if (!netOk) {
       doc["msg"] = "Sin registro en la red celular (revisar SIM/cobertura/antena)";
+      strlcpy(mdiag.step, "RED", sizeof(mdiag.step));
       modemPowerOff();
+      LTE_TEST_DIAG();
       esp_task_wdt_add(NULL);
       String response;
       serializeJson(doc, response);
@@ -1462,9 +1551,12 @@ void setupServerRoutes() {
       modem.gprsDisconnect();
     } else {
       doc["msg"] = "Registrado en red, pero falló GPRS (revisar APN: " + RUNapn + ")";
+      strlcpy(mdiag.step, "GPRS", sizeof(mdiag.step));
     }
 
     modemPowerOff();
+    LTE_TEST_DIAG();
+    #undef LTE_TEST_DIAG
     esp_task_wdt_add(NULL);
 
     String response;
@@ -1667,6 +1759,7 @@ void setupServerRoutes() {
     if (request->hasParam(PARAM_CONN_TYPE)) {
       String val = request->getParam(PARAM_CONN_TYPE)->value();
       writeFile(SPIFFS, "/connType.txt", val.c_str());
+      connectionType = val;  // /ltetest y demás handlers usan la global
       Serial.println("[SAVE] connType: " + val);
     }
     else if (request->hasParam(PARAM_SSID)) {
@@ -1698,6 +1791,23 @@ void setupServerRoutes() {
       String val = request->getParam("topicSub")->value();
       writeFile(SPIFFS, "/topicSub.txt", val.c_str());
       Serial.println("[SAVE] Topic Subscribe: " + val);
+    }
+    else if (request->hasParam("batReal")) {
+      // Factor = real / medido sin calibrar (promedio de varias lecturas).
+      float real = request->getParam("batReal")->value().toFloat();
+      float raw = 0;
+      for (int i = 0; i < 8; i++) { raw += vBatRaw(); delay(5); }
+      raw /= 8;
+      if (real <= 0.1f) batCalFactor = 1.0f;
+      else if (raw > 0.5f) batCalFactor = real / raw;
+      if (batCalFactor < 0.5f || batCalFactor > 1.5f) {
+        msg = "Factor fuera de rango (" + String(batCalFactor, 3) + "), no se guarda";
+        batCalFactor = readFile(SPIFFS, "/batCal.txt").toFloat();
+        if (batCalFactor <= 0) batCalFactor = 1.0f;
+      } else {
+        saveSetting(String(batCalFactor, 4), "/batCal.txt");
+      }
+      Serial.printf("[SAVE] Batería: real %.2f V, medido %.2f V -> factor %.4f\n", real, raw, batCalFactor);
     }
     else if (request->hasParam("apn")) {
       String val = request->getParam("apn")->value();
@@ -1762,6 +1872,8 @@ void setupServerRoutes() {
 //   y  13-21  modo (OPER / CONFIG / ESTADO) invertido
 //   y  24-95  solo los sensores HABILITADOS, una fila cada uno
 //   y  98-125 proceso: paso actual + 2 líneas de detalle
+//             (+ línea MODEM invertida encima cuando hay diagnóstico del
+//             SIM800: el proceso sube 9 px y se recortan sensores si no caben)
 //   y 126-127 barra de progreso de la secuencia
 
 void sensorsRailOn() {
@@ -1810,6 +1922,7 @@ struct Dash {
   int8_t bars = -1;         // señal 0..4, -1 = sin dato
   String step = "";         // paso actual de la secuencia
   String detail[2];         // detalle del paso (o resultado)
+  String modem = "";        // línea de diagnóstico del modem ("" = oculta)
   uint8_t stepIdx = 0, stepTotal = 0;
   String v[DV_COUNT];       // valores ya formateados, "--" = sin dato
 } dash;
@@ -1859,6 +1972,9 @@ void dashBegin(const String &mode, uint8_t totalSteps) {
   dash.bars = -1;
   dash.step = "";
   dash.detail[0] = dash.detail[1] = "";
+  // Si el último reset ocurrió con el modem encendido, se deja a la vista
+  // el paso en que murió hasta que el modem vuelva a usarse.
+  dash.modem = rstModemStep.length() ? "R!" + rstModemStep : "";
   dash.stepIdx = 0;
   dash.stepTotal = totalSteps;
   for (int i = 0; i < DV_COUNT; i++) dash.v[i] = "--";
@@ -1974,7 +2090,7 @@ void dashDrawBattery(int x, int y) {
   }
   int pct = batPercent(dash.batV);
   oled.fillRect(x + 2, y + 2, (9 * pct + 50) / 100, 3, SSD1306_WHITE);
-  dashText(x + 18, y, String(pct) + "%");
+  dashText(x + 18, y, String(dash.batV, 2) + "V");
 }
 
 void dashDrawBars(int x, int y) {
@@ -2006,7 +2122,8 @@ void dashDraw() {
   dashText(1, 13, dash.mode, true);
   dashTextRight(13, dash.link, true);
 
-  // Sensores habilitados
+  // Sensores habilitados (con la línea MODEM visible el área baja a y<88)
+  const int procY = dash.modem.length() ? 88 : 97;
   int y = 25;
   const int rowH = 8;
   // Nombres de 3 caracteres: TSU/HSU = temperatura/humedad del suelo
@@ -2023,11 +2140,18 @@ void dashDraw() {
   }
   if (y == 25) dashText(0, y, "Sin sens.");
 
-  // Proceso
-  oled.drawFastHLine(0, 97, W, SSD1306_WHITE);
-  dashText(0, 100, dash.step.substring(0, 10));
-  dashText(0, 109, dash.detail[0]);
-  dashText(0, 117, dash.detail[1]);
+  // Proceso (borra sensores que se hayan dibujado por debajo de procY)
+  oled.fillRect(0, procY, W, 128 - procY, SSD1306_BLACK);
+  oled.drawFastHLine(0, procY, W, SSD1306_WHITE);
+  int py = procY + 2;
+  if (dash.modem.length()) {
+    oled.fillRect(0, py - 1, W, 9, SSD1306_WHITE);
+    dashText(0, py, dash.modem.substring(0, 10), true);
+    py += 9;
+  }
+  dashText(0, py, dash.step.substring(0, 10));
+  dashText(0, py + 9, dash.detail[0].substring(0, 10));
+  dashText(0, py + 17, dash.detail[1].substring(0, 10));
   if (dash.stepTotal > 0) {
     oled.drawFastHLine(0, 127, W, SSD1306_WHITE);
     oled.fillRect(0, 125, W * dash.stepIdx / dash.stepTotal, 3, SSD1306_WHITE);
@@ -2244,8 +2368,8 @@ void configOledTask() {
 }
 
 /* ---------- Consulta de estado (wakeup EXT0 por botón "ok") ---------- */
-// 0 = dashboard de la última medición | 1 = conectividad | 2 = sistema
-#define STATUS_PAGES 3
+// 0 = dashboard | 1 = conectividad | 2 = sistema | 3 = diagnóstico del modem
+#define STATUS_PAGES 4
 
 void drawStatusPage(int page, int pending) {
   const String footer = "OK2s:medir";
@@ -2267,6 +2391,10 @@ void drawStatusPage(int page, int pending) {
                   lastModemMv > 0 ? String(lastModemMv / 1000.0f, 2) + "V" : "--",
                   String(pending), String(next) + "s"};
     oledInfoPage("CONEXION", k, v, 6, footer);
+    return;
+  }
+  if (page == 3) {
+    drawModemDiagPage(footer);
     return;
   }
   static String brownouts = readFile(SPIFFS, "/brownouts.txt");
@@ -2411,25 +2539,24 @@ void setting() {
 }
 
 /* ====================== BATTERY VOLTAGE ======================== */
-String vBat() {
-  // Divisor del esquemático: R10=390k (arriba) / R11=100k (abajo) →
-  // V_bat = V_adc × (390+100)/100. Con 4.2 V de batería el ADC ve ~0.86 V,
-  // zona en la que analogReadMilliVolts() (corregida con la calibración
-  // eFuse del chip) es bastante lineal. Se promedian varias muestras porque
-  // la impedancia del divisor (~78k) hace ruidosa cada lectura individual.
-  // La calibración de 2 puntos anterior era para el divisor 100k/100k y ya
-  // no aplica: BAT_CAL_SLOPE/OFFSET quedan neutros hasta recalibrar contra
-  // un multímetro con este divisor.
-  const float BAT_DIV_RATIO  = (390.0f + 100.0f) / 100.0f;
-  const float BAT_CAL_SLOPE  = 1.0f;
-  const float BAT_CAL_OFFSET = 0.0f;
-
+// Tensión de batería SIN calibrar: divisor R10=330k (arriba) / R11=100k
+// (abajo) → V_bat = V_adc × (330+100)/100 = ×4.3. Con 4.2 V de batería
+// el ADC ve ~0.98 V, zona en la que analogReadMilliVolts() (corregida con
+// la calibración eFuse del chip) es bastante lineal. Se promedian varias
+// muestras porque la impedancia del divisor (~78k) hace ruidosa cada lectura.
+float vBatRaw(int samples) {
+  const float BAT_DIV_RATIO = (330.0f + 100.0f) / 100.0f;
   uint32_t mvSum = 0;
-  for (int i = 0; i < 16; i++) mvSum += analogReadMilliVolts(pinBattery);
-  float v_adc = (mvSum / 16.0f) / 1000.0f;
-  float voltage = v_adc * BAT_DIV_RATIO * BAT_CAL_SLOPE + BAT_CAL_OFFSET;
+  for (int i = 0; i < samples; i++) mvSum += analogReadMilliVolts(pinBattery);
+  return (mvSum / (float)samples) / 1000.0f * BAT_DIV_RATIO;
+}
 
-  return String(voltage, 2);
+// Batería calibrada: batCalFactor (/batCal.txt) se obtiene desde el portal
+// con un multímetro (factor = real / medido) para corregir la tolerancia de
+// las resistencias y el error del ADC. (Con la relación errónea 390k/100k
+// se leían 4.67 V con ~4.0 V reales; con 330k/100k da ~4.10 V.)
+String vBat() {
+  return String(vBatRaw(16) * batCalFactor, 2);
 }
 
 /* ========================= RAIN COUNTER ========================= */
@@ -2863,9 +2990,339 @@ void modemApplyBand() {
   Serial.printf("[MODEM] Banda %s: %s\n", MODEM_BAND, ok ? "OK" : "rechazada");
 }
 
+/* ---------- Diagnóstico del modem (visible en el OLED) ---------- */
+// En campo no hay monitor serie, así que lo que pasa al encender el SIM800
+// se resume aquí y se muestra en una página del OLED cuando el envío LTE
+// falla (y en la consulta de estado, vista "MODEM"). RTC_DATA_ATTR para que
+// sobreviva al deep sleep y pueda verse con el botón "ok" más tarde.
+static char mdiagLine[48];     // línea en construcción (para detectar URCs)
+static uint8_t mdiagLineLen = 0;
+static bool mdiagSawOK = false;
+static bool mdiagSawReady = false;   // "SMS Ready": el SIM800 terminó de arrancar
+
+// Batería rápida (4 muestras): para seguir la caída durante los bursts.
+float vBatQuick() {
+  return vBatRaw(4) * batCalFactor;
+}
+
+void mdiagTrackBat() {
+  float v = vBatQuick();
+  if (mdiag.vBatMin <= 0 || v < mdiag.vBatMin) mdiag.vBatMin = v;
+}
+
+void mdiagReset() {
+  memset(&mdiag, 0, sizeof(mdiag));
+  mdiag.rxLevel = mdiag.rxPre = mdiag.rxOn = mdiag.txIdle = -1;
+  mdiagLineLen = 0;
+  mdiagSawReady = false;
+}
+
+// Re-inicializa el SSD1306 sin tocar el bus: el OLED cuelga de v_sensor y
+// la caída de tensión al energizar el modem puede resetearlo (queda negro
+// o congelado aunque el ESP32 siga vivo). Reenviar la secuencia de init es
+// inocuo si no se había reseteado.
+void oledRecover() {
+  if (!oledReady) return;
+  Wire.beginTransmission(OLED_ADDR);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("[OLED] Sin ACK tras encender el modem");
+    return;
+  }
+  oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR, false, false);
+  oled.setRotation(OLED_ROTATION);
+  oled.setTextWrap(false);
+}
+
+// Paso de la secuencia de diagnóstico del modem: se muestra en la línea
+// MODEM del dashboard (+ 2 líneas de detalle) y se guarda en modemStep
+// (RTC_NOINIT) ANTES de ejecutar la acción, así si el ESP32 se cuelga o
+// se reinicia queda visible / se recuerda el último paso alcanzado.
+void mdiagShow(const String &line, const String &d0 = "", const String &d1 = "") {
+  Serial.printf("[MODEM] %s | %s %s\n", line.c_str(), d0.c_str(), d1.c_str());
+  modemStepSet(line.c_str());
+  dash.modem = line;
+  dash.detail[0] = d0;
+  dash.detail[1] = d1;
+  if (oledReady) dashDraw();
+}
+
+// Procesa un byte recibido del modem: cuenta, guarda la cola imprimible y
+// detecta líneas URC relevantes. Las de tensión tienen prioridad sobre las
+// informativas (RDY/CPIN/Call Ready) y no se sobrescriben.
+void mdiagFeed(char c) {
+  if (mdiag.hexN < sizeof(mdiag.hex)) mdiag.hex[mdiag.hexN++] = (uint8_t)c;
+  mdiag.rxBytes++;
+  if (c == '\r' || c == '\n') {
+    if (mdiagLineLen == 0) return;
+    mdiagLine[mdiagLineLen] = '\0';
+    mdiagLineLen = 0;
+    Serial.printf("[MODEM<] %s\n", mdiagLine);
+    if (strcmp(mdiagLine, "OK") == 0) { mdiagSawOK = true; return; }
+    if (strstr(mdiagLine, "SMS Ready")) mdiagSawReady = true;
+    bool volt = strstr(mdiagLine, "VOLT") || strstr(mdiagLine, "POWER DOWN");
+    bool urcVolt = strstr(mdiag.urc, "VOLT") || strstr(mdiag.urc, "POWER DOWN");
+    if (volt || (!urcVolt && strncmp(mdiagLine, "AT", 2) != 0))
+      strlcpy(mdiag.urc, mdiagLine, sizeof(mdiag.urc));
+    return;
+  }
+  if (c < 0x20 || c > 0x7E) { c = '?'; mdiag.badBytes++; }  // basura (baudrate distinto, ruido)
+  if (mdiagLineLen < sizeof(mdiagLine) - 1) mdiagLine[mdiagLineLen++] = c;
+  size_t n = strlen(mdiag.tail);
+  if (n >= sizeof(mdiag.tail) - 1) {
+    memmove(mdiag.tail, mdiag.tail + 1, n);
+    n--;
+  }
+  mdiag.tail[n] = c;
+  mdiag.tail[n + 1] = '\0';
+}
+
+// Primeros bytes crudos en hex ("FF 00 80"), para ver basura de baudrate/ruido.
+String mdiagHexTxt() {
+  String h;
+  for (int i = 0; i < mdiag.hexN; i++) {
+    char b[4];
+    snprintf(b, sizeof(b), i ? " %02X" : "%02X", mdiag.hex[i]);
+    h += b;
+  }
+  return h.length() ? h : "(nada)";
+}
+
+// Lee el UART del modem durante ms milisegundos, siguiendo la batería.
+// live: refresca cada 500 ms las 2 líneas de detalle con la batería mínima,
+// nivel de RX, bytes recibidos y segundos transcurridos.
+void mdiagPump(uint32_t ms, bool live = false) {
+  uint32_t t0 = millis(), lastBat = 0, lastDraw = 0;
+  while (millis() - t0 < ms) {
+    while (SerialAT.available()) mdiagFeed((char)SerialAT.read());
+    if (millis() - lastBat >= 100) { mdiagTrackBat(); lastBat = millis(); }
+    if (live && oledReady && millis() - lastDraw >= 500) {
+      lastDraw = millis();
+      dash.detail[0] = "Bmin " + String(mdiag.vBatMin, 2);
+      dash.detail[1] = "RX" + String(digitalRead(PIN_RX2)) + " " + String(mdiag.rxBytes) + "B " +
+                       String((millis() - t0) / 1000) + "s";
+      dashDraw();
+    }
+    delay(5);
+  }
+}
+
+// Envía "AT" hasta tries veces a la velocidad indicada; true si respondió OK.
+bool mdiagProbe(const char *line, uint32_t baud, int tries) {
+  Serial.printf("[MODEM] Probando AT a %lu baud\n", (unsigned long)baud);
+  SerialAT.updateBaudRate(baud);
+  delay(20);
+  while (SerialAT.available()) mdiagFeed((char)SerialAT.read());
+  mdiagSawOK = false;
+  for (int i = 0; i < tries && !mdiagSawOK; i++) {
+    mdiagShow(line, "intento " + String(i + 1) + "/" + String(tries),
+              String(mdiag.rxBytes) + "B rx");
+    SerialAT.print("AT\r\n");
+    mdiagPump(600);
+  }
+  return mdiagSawOK;
+}
+
+// Prueba AT SOLO de diagnóstico, después de que modem.init() falló (la
+// comunicación normal es la de PROD: init directo). 9600 y luego otros
+// baudrates por si quedó fijado uno con AT+IPR; si responde a otro, lo
+// devuelve a 9600. No se prueba TX/RX intercambiado: pondría la salida del
+// ESP32 contra la salida TXD del SIM800.
+String mdiagBaudTxt(uint32_t b) {
+  if (!b) return "no";
+  if (b % 1000 == 0) return String(b / 1000) + "k";
+  return String(b / 1000.0f, 1) + "k";
+}
+
+bool mdiagTryBauds(const char *line, const uint32_t *bauds, int n, int tries) {
+  for (int i = 0; i < n; i++) {
+    String l = String(line) + " " + mdiagBaudTxt(bauds[i]);
+    if (mdiagProbe(l.c_str(), bauds[i], tries)) { mdiag.atBaud = bauds[i]; return true; }
+  }
+  return false;
+}
+
+// Estabiliza el enlace antes de modem.init(), sin cortar la alimentación:
+//   M4 SYNC    "AT" cada 500 ms hasta el primer OK (sincroniza el autobaud)
+//   M5 ESPERA  deja terminar el arranque: hasta "SMS Ready" o MODEM_QUIET_MS
+//              de silencio (máx. MODEM_READY_MS)
+//   M6 ESTABLE MODEM_STABLE_OK respuestas "OK" seguidas sin bytes corruptos
+// Devuelve false si nunca respondió (entonces sí conviene reiniciar).
+bool modemStabilize() {
+  // M4: sincronizar
+  mdiagSawOK = false;
+  uint32_t t0 = millis();
+  int n = 0;
+  while (!mdiagSawOK && millis() - t0 < MODEM_SYNC_MS) {
+    mdiagShow("M4 SYNC", "AT #" + String(++n), String((millis() - t0) / 1000) + "s " + String(mdiag.rxBytes) + "B");
+    SerialAT.print("AT\r\n");
+    mdiagPump(500);
+  }
+  if (!mdiagSawOK) {
+    Serial.println("[MODEM] Sin OK durante la sincronización");
+    return false;
+  }
+  mdiag.atBaud = UART_BAUD;
+
+  // M5: esperar fin del arranque
+  t0 = millis();
+  uint32_t lastRx = millis();
+  uint16_t prev = mdiag.rxBytes;
+  while (!mdiagSawReady && millis() - t0 < MODEM_READY_MS) {
+    mdiagPump(100);
+    if (mdiag.rxBytes != prev) { prev = mdiag.rxBytes; lastRx = millis(); }
+    if (millis() - lastRx >= MODEM_QUIET_MS && millis() - t0 >= MODEM_QUIET_MS) break;
+    if (oledReady && (millis() - t0) % 500 < 100) {
+      dash.modem = "M5 ESPERA";
+      dash.detail[0] = String((millis() - t0) / 1000) + "s " + String(mdiag.rxBytes) + "B";
+      dash.detail[1] = mdiag.urc[0] ? String(mdiag.urc) : String("err ") + mdiag.badBytes;
+      dashDraw();
+    }
+  }
+  Serial.printf("[MODEM] Arranque terminado en %lu ms (%s)\n", (unsigned long)(millis() - t0),
+                mdiagSawReady ? "SMS Ready" : "silencio/tiempo");
+
+  // M6: OK limpios seguidos
+  t0 = millis();
+  int good = 0, total = 0;
+  while (good < MODEM_STABLE_OK && millis() - t0 < MODEM_STABLE_MS) {
+    while (SerialAT.available()) mdiagFeed((char)SerialAT.read());
+    uint16_t badBefore = mdiag.badBytes;
+    mdiagSawOK = false;
+    SerialAT.print("AT\r\n");
+    mdiagPump(400);
+    total++;
+    if (mdiagSawOK && mdiag.badBytes == badBefore) good++;
+    else good = 0;
+    mdiagShow("M6 ESTABLE", "OK " + String(good) + "/" + String(MODEM_STABLE_OK),
+              "AT" + String(total) + " err" + String(mdiag.badBytes));
+    delay(300);
+  }
+  Serial.printf("[MODEM] Enlace %s: %d OK seguidos en %d AT, %u bytes corruptos\n",
+                good >= MODEM_STABLE_OK ? "estable" : "INESTABLE", good, total, mdiag.badBytes);
+  // Vaciar lo que quede para que modem.init() empiece con la línea limpia
+  mdiagPump(200);
+  while (SerialAT.available()) SerialAT.read();
+  return true;
+}
+
+// modem.init() con reintentos SIN cortar alimentación (vaciando la línea
+// entre intentos). Devuelve true si alguno funcionó.
+bool modemInitRetries() {
+  for (int i = 1; i <= MODEM_INIT_TRIES; i++) {
+    mdiagShow("M7 INIT " + String(i), "modem.init", "err " + String(mdiag.badBytes));
+    if (modem.init()) return true;
+    Serial.printf("[MODEM] init %d/%d falló\n", i, MODEM_INIT_TRIES);
+    mdiagPump(2000);
+    while (SerialAT.available()) SerialAT.read();
+  }
+  return false;
+}
+
+void modemDiagProbeAT() {
+  static const uint32_t first[] = {UART_BAUD};
+  static const uint32_t others[] = {115200, 57600, 38400, 19200};
+  mdiag.atBaud = 0;
+  bool ok = mdiagTryBauds("D1", first, 1, 3) || mdiagTryBauds("D2", others, 4, 2);
+  if (ok && mdiag.atBaud != UART_BAUD) {
+    Serial.printf("[MODEM] Responde a %lu: se fija 9600 (AT+IPR=9600;&W)\n", (unsigned long)mdiag.atBaud);
+    SerialAT.print("AT+IPR=9600;&W\r\n");
+    mdiagPump(500);
+  }
+  SerialAT.updateBaudRate(UART_BAUD);
+  delay(50);
+  if (ok) {
+    mdiagShow("D AT OK", mdiagBaudTxt(mdiag.atBaud), String(mdiag.rxBytes) + "B rx");
+  } else {
+    Serial.println("[MODEM] Sin respuesta AT a ningún baudrate");
+    mdiagShow("D AT NO", String(mdiag.rxBytes) + "B rx", mdiagHexTxt());
+  }
+}
+
+void mdiagTrackVsim(int16_t mv) {
+  if (mv > mdiag.vSimMax) mdiag.vSimMax = mv;
+}
+
+
+// Causa probable a partir del diagnóstico (texto corto para lastNetStatus).
+const char *modemDiagCause() {
+  if (strstr(mdiag.urc, "OVER") || mdiag.vSimMax >= SIM800_VMAX_MV) return "Modem sobrevoltaje";
+  if (strstr(mdiag.urc, "UNDER")) return "Modem bajo voltaje";
+  if (strstr(mdiag.urc, "POWER DOWN")) return "Modem se apago";
+  if (mdiag.rxPre == 1) return "RX alto sin modem";      // pull-up/retroalimentación
+  if (mdiag.rxBytes == 0 && mdiag.rxLevel == 0) return "Modem sin energia";
+  if (mdiag.txIdle == 0) return "TX ESP32 en corto/GND";
+  // Modem energizado (RX alto, LED de red parpadeando) pero ni un "OK" a
+  // ningún baudrate ni orientación: con autobaud el SIM800 no emite nada
+  // hasta sincronizar con un "AT", así que lo más probable es que no le
+  // llegue el TX del ESP32 (pista GPIO17 -> RXD del SIM800, soldadura,
+  // divisor/level shifter) o que su RXD esté dañado.
+  if (mdiag.atBaud == 0 && mdiag.rxBytes <= 4) return "Modem no recibe TX";
+  if (mdiag.atBaud == 0) return "Modem basura en RX";
+  return "Modem no responde";
+}
+
+// Registro del diagnóstico en la SD (/modem_diag.txt) para revisarlo luego.
+void modemDiagLogSD() {
+  if (!sdReady) return;
+  File f = SD.open("/modem_diag.txt", FILE_APPEND);
+  if (!f) return;
+  f.printf("%s paso=%s causa=%s vb0=%.2f vbmin=%.2f vmod=%d rx=%d>%d>%d tx=%d bytes=%u err=%u vsimmax=%d hex=%s at=%lu int=%u rst=%s urc=\"%s\" tail=\"%s\"\n",
+           formatTimestamp(getEpochNow()).c_str(), mdiag.step, lastNetStatus,
+           mdiag.vBat0, mdiag.vBatMin, lastModemMv, mdiag.rxPre, mdiag.rxOn, mdiag.rxLevel,
+           mdiag.txIdle, mdiag.rxBytes, mdiag.badBytes, mdiag.vSimMax, mdiagHexTxt().c_str(), (unsigned long)mdiag.atBaud,
+           mdiag.attempts, rstModemStep.c_str(), mdiag.urc, mdiag.tail);
+  f.close();
+}
+
+void drawModemDiagPage(const String &footer) {
+  String at = mdiagBaudTxt(mdiag.atBaud);
+  // RX: apagado > recién energizado > tras 3 s  (1 = alto, 0 = bajo, - = sin dato)
+  auto lv = [](int8_t l) { return l < 0 ? String("-") : String(l); };
+  String rx = lv(mdiag.rxPre) + ">" + lv(mdiag.rxOn) + ">" + lv(mdiag.rxLevel);
+  // Texto legible si lo hubo; si solo llegó basura, los bytes en hex
+  bool legible = false;
+  for (const char *c = mdiag.tail; *c; c++) if (isalnum((unsigned char)*c)) legible = true;
+  String msg = mdiag.urc[0] ? String(mdiag.urc) : legible ? String(mdiag.tail) : mdiagHexTxt();
+  String k[] = {"Paso", "Bat0", "Bmin", "Vsim", "RX", "TX/B", "AT", "Rst", "Msg"};
+  String v[] = {mdiag.step[0] ? String(mdiag.step) : "--",
+                mdiag.vBat0 > 0 ? String(mdiag.vBat0, 2) : "--",
+                mdiag.vBatMin > 0 ? String(mdiag.vBatMin, 2) : "--",
+                mdiag.vSimMax > 0 ? String(mdiag.vSimMax / 1000.0f, 2) + (mdiag.vSimMax >= SIM800_VMAX_MV ? "!" : "")
+                                  : lastModemMv > 0 ? String(lastModemMv / 1000.0f, 2) : "--",
+                rx, (mdiag.txIdle < 0 ? String("-") : String(mdiag.txIdle)) + "/" + String(mdiag.rxBytes),
+                at + "/" + String(mdiag.attempts),
+                rstModemStep.length() ? rstModemStep : "-", msg};
+  oledInfoPage("MODEM", k, v, 9, footer);
+}
+
+// Fallo del envío LTE: guarda el paso, registra en SD y deja la página de
+// diagnóstico en pantalla hasta 20 s (OK o UP la cierran antes).
+void modemDiagFail(const char *step) {
+  strlcpy(mdiag.step, step, sizeof(mdiag.step));
+  modemDiagLogSD();
+  dash.modem = String("X ") + step;
+  modemStepSet("");
+  if (!oledReady) return;
+  drawModemDiagPage("OK:seguir");
+  pinMode(BTN_OK_PIN, INPUT);  // pull-up externo 100k
+  pinMode(BTN_UP_PIN, INPUT);
+  uint32_t t0 = millis();
+  delay(300);
+  while (millis() - t0 < 20000) {
+    if (digitalRead(BTN_OK_PIN) == LOW || digitalRead(BTN_UP_PIN) == LOW) break;
+    delay(20);
+  }
+}
+
 void modemPowerOn() {
   Serial.println("[MODEM] Encendiendo SIM800...");
   modemStepSet("Encendido");
+  mdiag.attempts++;
+  mdiagSawReady = false;  // cada encendido vuelve a esperar su "SMS Ready"
+  mdiag.vBat0 = vBatQuick();
+  mdiagTrackBat();
+  mdiagShow("M1 BATERIA", "Vb " + String(mdiag.vBat0, 2) + "V",
+            "intento " + String(mdiag.attempts));
   modemBrownoutRideThrough(true);
 
   // Liberar el hold LOW de RX2/TX2 antes de que begin() los reconfigure
@@ -2874,16 +3331,51 @@ void modemPowerOn() {
   // queda en reposo (HIGH) y no debe pelear contra un LOW forzado.
   gpio_hold_dis((gpio_num_t)PIN_TX2);
   gpio_hold_dis((gpio_num_t)PIN_RX2);
-  pinMode(PIN_RX2, INPUT);
+  // Nivel de RX con el modem APAGADO y pull-down interno (~45k): si aun así
+  // lee 1, algo externo lo sube (pull-up del módulo alimentado por otro lado
+  // o retroalimentación), y "RX alto" después no prueba que el modem viva.
+  pinMode(PIN_RX2, INPUT_PULLDOWN);
+  delay(5);
+  mdiag.rxPre = digitalRead(PIN_RX2);
 
   modemPoweredOn = true;  // antes de la espera: ver rs485PowerOff()
+  mdiagShow("M2 RIEL ON", "RX apag " + String(mdiag.rxPre), "directo");
   modemRailOn();
-  delay(3000);  // esperar arranque del SIM800
+  delay(150);
+  mdiag.rxOn = digitalRead(PIN_RX2);
+  pinMode(PIN_RX2, INPUT);
+  oledRecover();
+
+  // Como PROD (a603f7a), pero MODEM_BOOT_MS: arranque con el UART CERRADO y recién
+  // entonces SerialAT.begin(). Abrirlo antes captura basura/URC de arranque
+  // que luego se mezclan con las respuestas de modem.init(). Durante la
+  // espera solo se mide (batería, nivel de RX): nada se envía al modem.
+  uint32_t t0 = millis();
+  while (millis() - t0 < MODEM_BOOT_MS) {
+    mdiagTrackBat();
+    if (oledReady) {
+      dash.modem = "M3 ARRANQ";
+      dash.detail[0] = "Bmin " + String(mdiag.vBatMin, 2);
+      dash.detail[1] = "RX" + String(digitalRead(PIN_RX2)) + " " + String((millis() - t0) / 1000) + "s";
+      dashDraw();
+    }
+    delay(250);
+  }
+  mdiag.rxLevel = digitalRead(PIN_RX2);  // idle HIGH = TX del modem energizado
+  oledRecover();
 
   SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX2, PIN_TX2);
+  // Pad TX en reposo (el UART lo deja en HIGH): 0 = línea cargada/en corto
+  PIN_INPUT_ENABLE(GPIO_PIN_MUX_REG[PIN_TX2]);
+  mdiag.txIdle = gpio_get_level((gpio_num_t)PIN_TX2);
   modemPoweredOn = true;
 
-  Serial.println("[MODEM] SIM800 encendido");
+  Serial.printf("[MODEM] SIM800 encendido: Vbat %.2f->%.2f V, RX %d>%d>%d, TX %d\n",
+                mdiag.vBat0, mdiag.vBatMin, mdiag.rxPre, mdiag.rxOn, mdiag.rxLevel, mdiag.txIdle);
+  mdiagShow(mdiag.rxLevel ? "M3 RX ALTO" : "M3 RX BAJO",
+            "Bmin " + String(mdiag.vBatMin, 2),
+            "RX " + String(mdiag.rxPre) + ">" + String(mdiag.rxOn) + ">" + String(mdiag.rxLevel) +
+            " TX" + String(mdiag.txIdle));
 }
 
 void modemPowerOff() {
@@ -3427,19 +3919,30 @@ bool waitForNetworkMonitored(uint32_t timeoutMs) {
     }
     int16_t mv = modem.getBattVoltage();
     int csq = modem.getSignalQuality();
+    mdiagTrackBat();
+    mdiagTrackVsim(mv);
     if (mv > 0 && mv < minMv) minMv = mv;
     Serial.printf("[LTE] t=%2lus CREG=%d CSQ=%d V=%d mV%s\n",
                   (unsigned long)((millis() - start) / 1000), (int)st, csq, mv,
                   (mv > 0 && mv < 3500) ? "  <-- BAJA" : "");
     if (oledReady) {
       dash.bars = csqToBars(csq);
-      oledLog("CSQ " + String(csq) + " " + String(mv / 1000.0f, 2) + "V");
+      dash.modem = "M8 CREG " + String((int)st);
+      dash.detail[0] = "CSQ " + String(csq) + " " + String((millis() - start) / 1000) + "s";
+      // S = tensión en el SIM800 (AT+CBC), B = batería mínima (ESP32)
+      dash.detail[1] = "S" + String(mv / 1000.0f, 2) + " B" + String(mdiag.vBatMin, 1);
+      dashDraw();
     }
 
     if (st == REG_NO_RESULT && mv <= 0) {
       if (++noAnswer >= 2) {
-        Serial.println("[ERROR] El SIM800 dejó de responder buscando red (¿se apagó por bajo voltaje?)");
-        setNetStatus("Modem se apago");
+        if (mdiag.vSimMax >= SIM800_VMAX_MV) {
+          Serial.printf("[ERROR] El SIM800 se apagó por SOBREVOLTAJE (llegó a %d mV, máx 4400)\n", mdiag.vSimMax);
+          setNetStatus("Modem sobrevoltaje");
+        } else {
+          Serial.println("[ERROR] El SIM800 dejó de responder buscando red (¿se apagó por bajo voltaje?)");
+          setNetStatus("Modem se apago");
+        }
         if (minMv < 9999) lastModemMv = minMv;
         return false;
       }
@@ -3463,18 +3966,27 @@ bool sendDataLTE(String jsonData) {
   Serial.println("\n[LTE] Iniciando envío de datos...");
   dashStep("MODEM", "encendiendo");
   lastSignal[0] = '\0';
+  mdiagReset();
+  lastModemMv = -1;
 
   // Encender modem
   modemPowerOn();
 
-  // Inicializar modem
-  if (!modem.init()) {
+  // Inicializar modem: arranque largo + estabilización del enlace (ver
+  // modemStabilize()) y hasta MODEM_INIT_TRIES init sin cortar alimentación.
+  // Solo si todo eso falla se reinicia (el LED de red se apaga y vuelve a
+  // parpadear) y se repite. Las pruebas AT de diagnóstico van al final.
+  bool linkOk = modemStabilize();
+  if (!linkOk || !modemInitRetries()) {
+    mdiagShow("M7 CORTE", linkOk ? "init fallo" : "sin AT", "reinicio");
     modemRestart();
-    delay(2000);
-    if (!modem.init()) {
+    linkOk = modemStabilize();
+    if (!linkOk || !modemInitRetries()) {
+      modemDiagProbeAT();
       Serial.println("[ERROR] Modem no responde");
-      setNetStatus("Modem no responde");
+      setNetStatus(modemDiagCause());
       modemPowerOff();
+      modemDiagFail("INIT");
       return false;
     }
   }
@@ -3486,19 +3998,30 @@ bool sendDataLTE(String jsonData) {
   // módulo avisa UNDER-VOLTAGE y bajo ~3.4 V se apaga solo en plena
   // transmisión — es el diagnóstico directo de los reinicios.
   lastModemMv = modem.getBattVoltage();
+  mdiagTrackVsim(lastModemMv);
   Serial.printf("[LTE] Tensión en el SIM800: %d mV%s\n", lastModemMv,
-                (lastModemMv > 0 && lastModemMv < 3500) ? "  <-- BAJA" : "");
-  if (lastModemMv > 0) oledLog("Vmod " + String(lastModemMv / 1000.0f, 2) + "V");
+                (lastModemMv > 0 && lastModemMv < 3500) ? "  <-- BAJA" :
+                lastModemMv >= SIM800_VMAX_MV ? "  <-- SOBREVOLTAJE (max 4.4 V)" : "");
+  if (lastModemMv >= SIM800_VMAX_MV) {
+    // Se sigue intentando (puede alcanzar a enviar), pero se avisa y se deja
+    // ver 2 s: el SIM800 se apagará solo en cuanto pase su umbral.
+    mdiagShow("M7 SOBREV!", "Vsim " + String(lastModemMv / 1000.0f, 2) + "V", "max 4.40V");
+    delay(2000);
+  }
+  mdiagShow("M7 INIT OK", "Vmod " + (lastModemMv > 0 ? String(lastModemMv / 1000.0f, 2) + "V" : String("--")),
+            "Bmin " + String(mdiag.vBatMin, 2));
 
   // Esperar red
   Serial.println("[LTE] Esperando red...");
   dashStep("RED", "buscando");
-  modemStepSet("Buscando red");
+  mdiagShow("M8 RED", "buscando", "");
   if (!waitForNetworkMonitored(60000L)) {
     Serial.println("[ERROR] Sin registro en la red");
-    if (strcmp(lastNetStatus, "Modem se apago") != 0 && strcmp(lastNetStatus, "Registro denegado") != 0)
+    if (strcmp(lastNetStatus, "Modem se apago") != 0 && strcmp(lastNetStatus, "Registro denegado") != 0 &&
+        strcmp(lastNetStatus, "Modem sobrevoltaje") != 0)
       setNetStatus("Sin cobertura");
     modemPowerOff();
+    modemDiagFail("RED");
     return false;
   }
 
@@ -3511,11 +4034,12 @@ bool sendDataLTE(String jsonData) {
   // Conectar GPRS
   Serial.println("[LTE] Conectando GPRS...");
   dashStep("GPRS", RUNapn);
-  modemStepSet("GPRS");
+  mdiagShow("M9 GPRS", RUNapn, "");
   if (!modem.gprsConnect(RUNapn.c_str())) {
     Serial.println("[ERROR] Fallo conexión GPRS");
     setNetStatus("Fallo GPRS");
     modemPowerOff();
+    modemDiagFail("GPRS");
     return false;
   }
 
@@ -3533,7 +4057,7 @@ bool sendDataLTE(String jsonData) {
   // no alcanza para el JSON con campos RS485: publish() fallaría en silencio.
   simclient.setBufferSize(768);
   dashStep("MQTT", serverIP);
-  modemStepSet("MQTT");
+  mdiagShow("M10 MQTT", serverIP, "");
 
   // Conectar a MQTT
   int mqttRetries = 0;
@@ -3556,6 +4080,7 @@ bool sendDataLTE(String jsonData) {
     setNetStatus("Fallo MQTT");
     modem.gprsDisconnect();
     modemPowerOff();
+    modemDiagFail("MQTT");
     return false;
   }
 
@@ -3600,6 +4125,7 @@ bool sendDataLTE(String jsonData) {
   modemPowerOff();
 
   Serial.println("[LTE] Desconectado");
+  dash.modem = "M OK CSQ" + String(csq);
   oledLog("modem off");
 
   return published;
@@ -3783,10 +4309,13 @@ void init_running() {
     readConfig();
     opCycleCount++;
 
-    // 80 MHz basta para sensores, SD, WiFi y el UART del modem, y ahorra
-    // ~20-30 mA durante todo el ciclo (sobre todo los segundos con el modem).
-    Serial.flush();  // cambiar la frecuencia con bytes en el FIFO del UART los corrompe
-    setCpuFrequencyMhz(80);
+    // 80 MHz ahorra ~20-30 mA durante el ciclo, pero en LTE se mantiene la
+    // frecuencia por defecto (240 MHz) como en PROD (a603f7a), que conectaba:
+    // tras bajar a 80 MHz aparecieron bytes corruptos en el UART del SIM800.
+    if (connectionType != "LTE") {
+      Serial.flush();  // cambiar la frecuencia con bytes en el FIFO del UART los corrompe
+      setCpuFrequencyMhz(80);
+    }
 
     // OLED del ciclo: si está habilitado (/oledOp.txt) o ya activo (ciclo
     // manual desde la consulta de estado). Mantiene v_sensor encendido
@@ -4211,6 +4740,7 @@ void setup() {
       modemStepMagic == MODEM_STEP_MAGIC && modemStep[0]) {
     modemStep[sizeof(modemStep) - 1] = '\0';
     Serial.printf("[BOOT] El reset ocurrió con el modem en el paso: %s\n", modemStep);
+    rstModemStep = String(modemStep).substring(0, 10);
   }
   modemStepMagic = 0;
 
@@ -4259,6 +4789,11 @@ void setup() {
   loadTimeBase();
 
   createDefaultConfigs();
+  {
+    float f = readFile(SPIFFS, "/batCal.txt").toFloat();
+    batCalFactor = (f >= 0.5f && f <= 1.5f) ? f : 1.0f;
+    Serial.printf("[BAT] Factor de calibración: %.4f\n", batCalFactor);
+  }
 
   // Leer configuración
   readConfig();
