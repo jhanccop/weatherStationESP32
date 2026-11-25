@@ -9,8 +9,10 @@
  * Mapa de pines:
  *   SIM800   : RX2=16 (recibe del TX del modem) / TX2=17 (transmite al RX del modem)
  *              Alimentación por GPIO15 (sim_control) -> NPN Q4 -> MOSFET canal P Q1:
- *              lógica NO invertida (HIGH=ON, LOW=OFF). El mismo sim_control también
- *              enciende (Q5 -> Q3) el elevador SX1308 de 12V del módulo RS485.
+ *              lógica NO invertida (HIGH=ON, LOW=OFF). Solo el modem.
+ *   RS485    : Serial1 TX=32 / RX=33 (módulo TTL-RS485 auto-dirección en v_sensor).
+ *              12V del sensor (elevador SX1308) controlado por GPIO14/D14
+ *              (RS485_PWR_PIN, HIGH=ON), independiente del modem.
  *   Sensores : Alimentación controlada por MOSFET canal P en GPIO2/D2 (LOW=ON, HIGH=OFF)
  *              (v_sensor: DHT, viento, encoder, OLED, conector I2C, RS485 TTL)
  *   OLED     : 0.96" SSD1306 128x64 por I2C (0x3C, mismo bus SDA=21/SCL=22), VCC = v_sensor
@@ -95,20 +97,43 @@ bool oledOpEnabled = true;  // mostrar el progreso en modo operación (/oledOp.t
 /* ====================== RS485 (Modbus RTU) ======================== */
 // Módulo TTL-RS485 con control de dirección automático (sin pin DE/RE),
 // alimentado por v_sensor (GPIO2). El sensor en sí toma 12V del elevador
-// SX1308 (A2), que habilita sim_control (GPIO15) — la MISMA señal que
-// enciende el modem: leer el sensor energiza también el SIM800 unos segundos.
+// SX1308 (A2), habilitado por GPIO14 (RS485_PWR_PIN), independiente del
+// modem (antes compartía sim_control/GPIO15 y cada lectura encendía el SIM800).
+// GPIO14 era el TRIG del sensor ultrasónico, que ya no existe.
 // Usa UART1 (Serial1) porque UART2 (Serial2) es del SIM800.
 // rs485Type (persistido en /rs485.txt, elegible desde el portal AP o por
 // MQTT) define qué sensor hay conectado:
 //   "SOIL": suelo 4-en-1, 9600 baud, regs 0..3 = hum/10, temp/10, EC, pH/10
 //   "RAD" : piranómetro, 4800 baud, reg 0 = radiación (W/m²)
+//   "LEVEL": nivel ultrasónico ACLT600, 9600 baud, reg 0x0001 = nivel crudo
+//            (int16, sin el offset +1000 del reg 0x0000). Protocolo confirmado
+//            con hardware real en el proyecto levelSIM7000. Tarda ~10 s en
+//            arrancar y sus lecturas se estabilizan antes de promediar.
 #define RS485_TX_PIN      32   // net "TXD" del esquemático
 #define RS485_RX_PIN      33   // net "RXD" del esquemático
 #define RS485_SLAVE_ADDR  1
+#define RS485_PWR_PIN     14   // habilita el elevador 12V del sensor RS485
+#define RS485_PWR_ON      HIGH
+#define RS485_PWR_OFF     LOW
 #define RS485_WARMUP_MS   1500 // elevador 12V + arranque del sensor
 #define RS485_TIMEOUT_MS  500
 #define RS485_RETRIES     3
-String rs485Type = "NONE";     // "NONE" | "SOIL" | "RAD"
+String rs485Type = "NONE";     // "NONE" | "SOIL" | "RAD" | "LEVEL"
+
+// Valida un valor de rs485Type (portal, MQTT, SPIFFS): lo desconocido = NONE.
+String rs485Norm(const String &v) {
+  return (v == "SOIL" || v == "RAD" || v == "LEVEL") ? v : String("NONE");
+}
+
+// ACLT600 (rs485Type "LEVEL"): ver readLevel() más abajo.
+#define LEVEL_REG              0x0001
+#define LEVEL_WARMUP_MS        10000  // el sensor tarda ~10 s en iniciar tras energizarse
+#define LEVEL_STABLE_WINDOW    8      // lecturas consecutivas que deben variar poco...
+#define LEVEL_STABLE_THRESHOLD 5      // ...a lo sumo esto (unidades crudas)
+#define LEVEL_STABLE_MAX_TRIES 30     // tope de lecturas buscando estabilidad
+#define LEVEL_AVG_SAMPLES      5      // lecturas finales promediadas
+#define LEVEL_SAMPLE_DELAY_MS  300
+#define LEVEL_MAX_FAILS        3      // fallos seguidos que abortan (sensor caído)
 
 /* ====================== DHT22 TEMP/HUM SETTINGS ======================== */
 #include <DHT.h>
@@ -136,10 +161,11 @@ uint64_t sdTotalMB = 0;
 uint64_t sdUsedMB = 0;
 uint64_t sdFreeMB = 0;
 
-// v2: columnas RS485 (ST,SH,EC,PH,RAD) añadidas al final. Archivo nuevo para
-// no mezclar filas de distinto ancho con el encabezado del datalog.csv viejo,
-// que queda en la tarjeta (descargable desde la lista de archivos).
-#define SD_LOG_PATH "/datalog_v2.csv"
+// v2: columnas RS485 (ST,SH,EC,PH,RAD) añadidas al final. v3: + LV (nivel).
+// Archivo nuevo en cada cambio de columnas para no mezclar filas de distinto
+// ancho bajo un mismo encabezado; los anteriores quedan en la tarjeta
+// (descargables desde la lista de archivos).
+#define SD_LOG_PATH "/datalog_v3.csv"
 
 /* ================ MARCA DE TIEMPO (hora real, sin RTC chip) ================ */
 // El ESP32 no tiene un RTC con batería propia ni GPS/NTP en este hardware, así
@@ -202,7 +228,6 @@ const char gprsPass[] = "";
 #define PIN_TX2             17
 // sim_control: GPIO15 -> R1 47k -> base NPN Q4 (R13 100k a GND); el colector
 // baja el gate del MOSFET canal P Q1. Por el NPN la lógica queda HIGH=ON.
-// También alimenta el elevador de 12V del RS485 (Q5/Q3) en paralelo.
 #define MODEM_PWR_PIN       15
 #define MODEM_PWR_ON        HIGH
 #define MODEM_PWR_OFF       LOW
@@ -327,6 +352,9 @@ bool brownoutBoot = false;
 bool lastCycleSent = false;  // resultado del envío de este ciclo (resumen OLED)   // este arranque viene de un reset por brownout
 float batCalFactor = 1.0f;   // calibración de vBat() (/batCal.txt)
 float cycleBatV = -1;        // batería medida en este ciclo, en reposo
+uint32_t sensRailOnMs = 0;   // millis() al encender v_sensor (0 = apagado): calentamiento del DHT
+uint32_t modemRailOnMs = 0;  // millis() al encender sim_control: arranque del SIM800
+uint32_t rs485RailOnMs = 0;  // millis() al encender el 12V del RS485 (GPIO14)
 
 /* Device settings */
 boolean A_TH = false;
@@ -343,8 +371,8 @@ const char* PARAM_CONN_TYPE = "connType";
 /* ====================== MQTT ======================== */
 const char *broker = "broker.hivemq.com"; //24.199.125.52
 const int mqtt_port = 1883;
-const char *topicSubscribe = "jhpAI/FAUNA/settings";
-const char *topicPublish = "jhpAI/FAUNA/data";
+const char *topicSubscribe = "jhpAI/HIDROMET/settings";
+const char *topicPublish = "jhpAI/HIDROMET/data";
 
 #include <PubSubClient.h>
 TinyGsmClient client(modem);
@@ -399,7 +427,7 @@ struct {
   String temp = "--", hum  = "--";
   String rain = "--", wvel = "--", wdir = "--", bat = "--";
   String rainStatus = "--", rainCount = "--";
-  String rsT = "--", rsH = "--", rsEC = "--", rsPH = "--", rsRad = "--";
+  String rsT = "--", rsH = "--", rsEC = "--", rsPH = "--", rsRad = "--", rsLv = "--";
   String rs485 = "--";  // resumen de una línea para la UI web
 } sensCache;
 
@@ -502,6 +530,7 @@ input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(1
 <option value="NONE" %RS485_NONE%>Ninguno</option>
 <option value="SOIL" %RS485_SOIL%>Suelo: temp, humedad, EC, pH (9600 baud)</option>
 <option value="RAD" %RS485_RAD%>Radiación solar W/m² (4800 baud)</option>
+<option value="LEVEL" %RS485_LEVEL%>Nivel ACLT600, crudo (9600 baud, ~15 s por lectura)</option>
 </select>
 <input type="submit" value="Guardar RS485">
 </form>
@@ -567,6 +596,15 @@ input[type=submit]:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(1
 </div>
 
 <div class="sc">
+<h3>&#x1F4E4; Datos Pendientes de Envío</h3>
+<div class="ps">Lecturas que no se pudieron enviar y esperan en la memoria interna (se reenvían solas en el próximo envío exitoso): <b id="pendCount">%PENDING_COUNT%</b></div>
+<button type="button" class="btn br heavy-btn" style="width:100%%;margin-bottom:10px" onclick="loadPending()">&#x1F441; Ver Pendientes</button>
+<button type="button" class="btn be heavy-btn" style="width:100%%" onclick="clearPending()">&#x1F5D1; Limpiar Pendientes</button>
+<div id="pendResult" class="ps"></div>
+<div class="dt" id="pendTableWrap"></div>
+</div>
+
+<div class="sc">
 <h3>&#x1F50B; Calibración de batería</h3>
 <div class="ps">Lectura actual: %BAT_NOW% V (factor %BAT_CAL%). Mide la batería con un multímetro en el mismo momento y escribe el valor real; 0 = quitar calibración.</div>
 <form action="/get"><div class="fr"><label>Voltaje real (V)</label><input type="number" step="0.01" min="0" max="6" name="batReal" placeholder="3.95"></div><input type="submit" value="Calibrar"></form>
@@ -625,6 +663,8 @@ function downloadSD(name){window.location.href=name?('/downloadsd?file='+encodeU
 function logNow(){if(busy)return;setBusy(true);var r=document.getElementById('sdResult');r.innerText='Leyendo sensores y guardando... (puede tardar unos segundos)';fetch('/lognow').then(r=>r.json()).then(d=>{r.innerText=d.msg;setBusy(false);loadDataTable();}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;setBusy(false);});}
 function loadSDFileList(){if(busy)return;setBusy(true);var w=document.getElementById('sdFileListWrap');w.innerHTML='<div class="ps" style="padding:8px">Cargando...</div>';fetch('/sdlist').then(r=>r.json()).then(d=>{if(!d.files||d.files.length==0){w.innerHTML='<div class="ps" style="padding:8px">Sin archivos en la SD.</div>';return;}var html='<table><thead><tr><th>Archivo</th><th>Tamaño</th><th></th></tr></thead><tbody>';d.files.forEach(function(f){var kb=(f.size/1024).toFixed(1);html+='<tr><td>'+f.name+'</td><td>'+kb+' KB</td><td><button type="button" class="btn br" style="padding:4px 10px" onclick="downloadSD(\''+f.name+'\')">&#x2B07;</button></td></tr>';});html+='</tbody></table>';w.innerHTML=html;}).catch(e=>{w.innerHTML='<div class="ps" style="padding:8px">Error de comunicación: '+e+'</div>';}).finally(()=>setBusy(false));}
 function loadDataTable(){var w=document.getElementById('dataTableWrap');w.innerHTML='<div class="ps" style="padding:8px">Cargando...</div>';fetch('/viewdata').then(r=>r.text()).then(t=>{var lines=t.split('\n').filter(l=>l.length>0);if(lines.length<2){w.innerHTML='<div class="ps" style="padding:8px">Sin datos registrados aún.</div>';return;}var head=lines[0].split(',');var html='<table><thead><tr>';head.forEach(h=>html+='<th>'+h+'</th>');html+='</tr></thead><tbody>';for(var i=lines.length-1;i>=1;i--){var cols=lines[i].split(',');html+='<tr>';cols.forEach(c=>html+='<td>'+c+'</td>');html+='</tr>';}html+='</tbody></table>';w.innerHTML=html;}).catch(e=>{w.innerHTML='<div class="ps" style="padding:8px">Error de comunicación: '+e+'</div>';});}
+function loadPending(){if(busy)return;setBusy(true);var w=document.getElementById('pendTableWrap');w.innerHTML='<div class="ps" style="padding:8px">Cargando...</div>';fetch('/pending').then(r=>r.text()).then(t=>{var lines=t.split('\n').filter(l=>l.trim().length>0);document.getElementById('pendCount').innerText=lines.length;if(lines.length==0){w.innerHTML='<div class="ps" style="padding:8px">No hay datos pendientes.</div>';return;}var cols=['timestamp','T','H','WV','WD','RA','vB','ST','SH','EC','PH','RAD'];var rows=[];lines.forEach(function(l){try{rows.push(JSON.parse(l));}catch(e){rows.push({timestamp:'(línea inválida)'});}});cols=cols.filter(function(c){return rows.some(function(o){return o[c]!=null;});});var MAX=100;var html=(rows.length>MAX?'<div class="ps" style="padding:8px">Mostrando los '+MAX+' más recientes de '+rows.length+'.</div>':'')+'<table><thead><tr>';cols.forEach(c=>html+='<th>'+c+'</th>');html+='</tr></thead><tbody>';for(var i=rows.length-1;i>=0&&i>=rows.length-MAX;i--){html+='<tr>';cols.forEach(c=>html+='<td>'+(rows[i][c]!=null?rows[i][c]:'')+'</td>');html+='</tr>';}html+='</tbody></table>';w.innerHTML=html;}).catch(e=>{w.innerHTML='<div class="ps" style="padding:8px">Error de comunicación: '+e+'</div>';}).finally(()=>setBusy(false));}
+function clearPending(){if(busy)return;if(!confirm('¿Borrar todos los datos pendientes de envío? Se perderán los que no estén también en la SD.'))return;setBusy(true);var r=document.getElementById('pendResult');fetch('/pendingclear').then(r=>r.json()).then(d=>{r.innerText=d.msg;document.getElementById('pendCount').innerText=d.count;document.getElementById('pendTableWrap').innerHTML='';}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;}).finally(()=>setBusy(false));}
 function lteTest(){if(busy)return;setBusy(true);var r=document.getElementById('lteResult');r.innerText='Probando... (enciende y estabiliza el modem, puede tardar 1-2 min)';fetch('/ltetest').then(r=>r.json()).then(d=>{var lines=[];if(d.modemInfo)lines.push('Modem: '+d.modemInfo);if(d.signal!=null)lines.push('Señal (CSQ): '+d.signal+(d.signal==99?' (desconocida)':''));if(d.simReady!=null)lines.push('SIM lista: '+(d.simReady?'sí':'no'));if(d.networkRegistered!=null)lines.push('Registrado en red: '+(d.networkRegistered?'sí':'no'));if(d.operator)lines.push('Operador: '+d.operator);if(d.gprsConnected!=null)lines.push('GPRS/Internet: '+(d.gprsConnected?'sí':'no'));if(d.ip)lines.push('IP: '+d.ip);if(d.vBat0!=null)lines.push('Bateria: '+d.vBat0+' V -> min '+d.vBatMin+' V'+(d.vMod>0?' | SIM800: '+(d.vMod/1000).toFixed(2)+' V':''));if(d.rxLevel!=null)lines.push('RX modem: '+(d.rxLevel==1?'ALTO':d.rxLevel==0?'BAJO (sin energia?)':'--')+', '+d.rxBytes+' bytes, AT: '+d.atBaud);if(d.rxPre!=null)lines.push('RX apagado/encendido/3s: '+d.rxPre+' > '+d.rxOn+' > '+d.rxLevel+(d.rxPre==1?' (alto SIN modem: pull-up externo)':''));if(d.txIdle!=null)lines.push('TX ESP32 en reposo: '+(d.txIdle==1?'alto (OK)':d.txIdle==0?'BAJO (linea en corto/cargada)':'--'));if(d.hex)lines.push('Bytes crudos: '+d.hex);if(d.errBytes)lines.push('Bytes corruptos en RX: '+d.errBytes);if(d.cause)lines.push('Causa probable: '+d.cause);if(d.warning)lines.push('<b>'+d.warning+'</b>');if(d.urc)lines.push('Mensaje modem: '+d.urc);if(d.tail)lines.push('Ultimo RX: '+d.tail);lines.push(d.msg||(d.ok?'OK':'Error'));document.getElementById('lteResult').innerHTML=lines.join('<br>');}).catch(e=>{r.innerText='Error de comunicación con el dispositivo: '+e;}).finally(()=>setBusy(false));}
 document.querySelectorAll('form').forEach(f=>{f.onsubmit=function(e){if(this.querySelector('input[name="resetRain"]')&&!confirm('¿Reiniciar el contador de lluvia a 0? Esta acción no se puede deshacer.')){e.preventDefault();return;}if(!this.querySelector('input[name="reset"]')){e.preventDefault();fetch('/get?'+new URLSearchParams(new FormData(this))).then(()=>location.href='/').catch(()=>location.href='/');}}});
 </script>
@@ -640,6 +680,7 @@ void writeFile(fs::FS &fs, const char *path, const char *message);
 void saveSetting(String value, String fil);
 String macA();
 String processor(const String& var);
+int countPendingRecords();
 void deepSleepSystem();
 void setting();
 void setupServerRoutes();
@@ -650,6 +691,7 @@ void readDHT22(float &temperature, float &humidity, bool &success, bool force = 
 float WindDirection();
 float WindVelocity();
 void modemPowerOn();
+void rs485RailOff();
 void mdiagReset();
 String mdiagHexTxt();
 void mdiagPump(uint32_t ms, bool live);
@@ -707,7 +749,7 @@ void runStatusViewer();
 void modemRailOn();
 uint64_t configuredSleepPeriod();
 struct Rs485Data;
-bool readRS485(Rs485Data &d);
+bool readRS485(Rs485Data &d, bool live);
 
 /* ====================== HTML SCRIPTS ======================== */
 void notFound(AsyncWebServerRequest *request) {
@@ -822,12 +864,13 @@ String processor(const String& var) {
   } else if (var == "A_WS_CHECKED") {
     return readFile(SPIFFS, "/A_WS.txt") == "1" ? "checked" : "";
   } else if (var == "RS485_NONE") {
-    String v = readFile(SPIFFS, "/rs485.txt");
-    return (v != "SOIL" && v != "RAD") ? "selected" : "";
+    return rs485Norm(readFile(SPIFFS, "/rs485.txt")) == "NONE" ? "selected" : "";
   } else if (var == "RS485_SOIL") {
     return readFile(SPIFFS, "/rs485.txt") == "SOIL" ? "selected" : "";
   } else if (var == "RS485_RAD") {
     return readFile(SPIFFS, "/rs485.txt") == "RAD" ? "selected" : "";
+  } else if (var == "RS485_LEVEL") {
+    return readFile(SPIFFS, "/rs485.txt") == "LEVEL" ? "selected" : "";
   } else if (var == "OLED_OP_CHECKED") {
     return readFile(SPIFFS, "/oledOp.txt") != "0" ? "checked" : "";
   } else if (var == "MT6701_SELECTED") {
@@ -868,6 +911,8 @@ String processor(const String& var) {
   } else if (var == "LTE_CARD_STYLE") {
     String connType = readFile(SPIFFS, "/connType.txt");
     return (connType == "LTE") ? "" : "display:none";
+  } else if (var == "PENDING_COUNT") {
+    return String(countPendingRecords());
   } else if (var == "TIME_BASE") {
     return timeBaseSet ? formatTimestamp(timeBaseEpoch) + " UTC (ancla)" : "Sin sincronizar";
   }
@@ -1033,7 +1078,7 @@ void logToSD(const String &jsonLine) {
   }
 
   if (isNew) {
-    f.println("timestamp,epoch_s,mac,conn,T,H,WV,WD,RA,vB,ST,SH,EC,PH,RAD");
+    f.println("timestamp,epoch_s,mac,conn,T,H,WV,WD,RA,vB,ST,SH,EC,PH,RAD,LV");
   }
 
   // 256 se quedaba corto y descartaba el registro entero (DeserializationError
@@ -1069,6 +1114,7 @@ void logToSD(const String &jsonLine) {
   row += ","; row += doc["EC"].as<String>();
   row += ","; row += doc["PH"].as<String>();
   row += ","; row += doc["RAD"].as<String>();
+  row += ","; row += doc["LV"].as<String>();
 
   // println() no reporta fallos de escritura de otra forma (disco lleno,
   // tarjeta caída a media escritura): comparar los bytes devueltos contra el
@@ -1371,11 +1417,14 @@ void deepSleepSystem() {
   digitalWrite(SENS_PWR_PIN, HIGH);
   gpio_hold_en((gpio_num_t)SENS_PWR_PIN);
 
-  // ===== APAGAR MODEM + 12V RS485 (sim_control, NPN+MOSFET: LOW=OFF) =====
+  // ===== APAGAR MODEM (sim_control, NPN+MOSFET: LOW=OFF) =====
   gpio_hold_dis((gpio_num_t)MODEM_PWR_PIN);
   pinMode(MODEM_PWR_PIN, OUTPUT);
   digitalWrite(MODEM_PWR_PIN, MODEM_PWR_OFF);
   gpio_hold_en((gpio_num_t)MODEM_PWR_PIN);
+
+  // ===== APAGAR 12V RS485 (GPIO14) =====
+  rs485RailOff();
 
   // ===== RX2/TX2 a LOW (no flotando): evita retroalimentar el SIM800 por
   // los pines UART mientras está sin alimentación. Incondicional: en modo
@@ -1727,6 +1776,35 @@ void setupServerRoutes() {
     request->send(200, "text/plain", out);
   });
 
+  // Datos pendientes de envío (/pending.jsonl en SPIFFS): se envía el
+  // archivo tal cual, en streaming (puede ser grande; no se carga en RAM).
+  // El JS del portal parsea cada línea JSON y arma la tabla.
+  server.on("/pending", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!SPIFFS.exists(PENDING_LOG_PATH)) {
+      request->send(200, "text/plain", "");
+      return;
+    }
+    request->send(SPIFFS, PENDING_LOG_PATH, "text/plain");
+  });
+
+  // Borra la cola de pendientes (no toca la SD, que conserva su respaldo).
+  server.on("/pendingclear", HTTP_GET, [](AsyncWebServerRequest *request) {
+    int before = countPendingRecords();
+    SPIFFS.remove(PENDING_LOG_PATH);
+    SPIFFS.remove(PENDING_LOG_TMP);
+    int after = countPendingRecords();
+    Serial.printf("[PENDING] Cola borrada desde el portal (%d registros)\n", before);
+
+    StaticJsonDocument<128> doc;
+    doc["ok"] = after == 0;
+    doc["count"] = after;
+    doc["msg"] = after == 0 ? String(before) + " registro(s) pendiente(s) borrado(s)"
+                            : String("No se pudo borrar la cola");
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
   // Recibe la hora actual (epoch, segundos Unix UTC) del dispositivo
   // conectado al AP, para anclar la marca de tiempo real de las mediciones
   // (ver setTimeBase()). Lo llama el JS del portal automáticamente al cargar.
@@ -1828,8 +1906,7 @@ void setupServerRoutes() {
       Serial.println("[SAVE] Period: " + period + " seg");
     }
     else if (request->hasParam("rs485")) {
-      String val = request->getParam("rs485")->value();
-      if (val != "SOIL" && val != "RAD") val = "NONE";
+      String val = rs485Norm(request->getParam("rs485")->value());
       writeFile(SPIFFS, "/rs485.txt", val.c_str());
       rs485Type = val;
       Serial.println("[SAVE] rs485: " + val);
@@ -1880,6 +1957,20 @@ void sensorsRailOn() {
   gpio_hold_dis((gpio_num_t)SENS_PWR_PIN);
   pinMode(SENS_PWR_PIN, OUTPUT);
   digitalWrite(SENS_PWR_PIN, LOW);  // MOSFET canal P: LOW = ON
+  if (!sensRailOnMs) sensRailOnMs = millis() | 1;  // |1: nunca 0 (= apagado)
+}
+
+void sensorsRailOff() {
+  gpio_hold_dis((gpio_num_t)SENS_PWR_PIN);
+  pinMode(SENS_PWR_PIN, OUTPUT);
+  digitalWrite(SENS_PWR_PIN, HIGH);
+  sensRailOnMs = 0;
+}
+
+// Espera hasta que hayan pasado ms desde el instante t0 (no espera si ya pasaron).
+void waitSince(uint32_t t0, uint32_t ms) {
+  uint32_t el = millis() - t0;
+  if (el < ms) delay(ms - el);
 }
 
 // Requiere v_sensor encendido y Wire ya iniciado (SDA=21/SCL=22).
@@ -1913,7 +2004,7 @@ void oledPower(bool on) {
 }
 
 /* ---------- Estado del dashboard ---------- */
-enum DashVal { DV_T, DV_H, DV_WV, DV_WD, DV_RA, DV_ST, DV_SH, DV_EC, DV_PH, DV_RAD, DV_COUNT };
+enum DashVal { DV_T, DV_H, DV_WV, DV_WD, DV_RA, DV_ST, DV_SH, DV_EC, DV_PH, DV_RAD, DV_LV, DV_COUNT };
 
 struct Dash {
   String mode = "";         // OPER / CONFIG / ESTADO
@@ -1960,8 +2051,8 @@ String dashLinkName(const String &type) {
 
 // Pasos de la secuencia del modo operación según el tipo de enlace
 uint8_t dashStepsFor(const String &type) {
-  if (type == "LTE") return 8;    // SENSORES SD MODEM RED GPRS MQTT ENVIO FIN
-  if (type == "WIFI") return 6;   // SENSORES SD WIFI MQTT ENVIO FIN
+  if (type == "LTE") return 8;    // SENSORES SD MODEM RED INTERNET SERVIDOR ENVIANDO FIN
+  if (type == "WIFI") return 6;   // SENSORES SD WIFI SERVIDOR ENVIANDO FIN
   return 3;                       // SENSORES SD FIN
 }
 
@@ -1974,7 +2065,8 @@ void dashBegin(const String &mode, uint8_t totalSteps) {
   dash.detail[0] = dash.detail[1] = "";
   // Si el último reset ocurrió con el modem encendido, se deja a la vista
   // el paso en que murió hasta que el modem vuelva a usarse.
-  dash.modem = rstModemStep.length() ? "R!" + rstModemStep : "";
+  // (el paso técnico queda en la página de detalle del modem)
+  dash.modem = rstModemStep.length() ? "!REINICIO" : "";
   dash.stepIdx = 0;
   dash.stepTotal = totalSteps;
   for (int i = 0; i < DV_COUNT; i++) dash.v[i] = "--";
@@ -2066,6 +2158,7 @@ void dashLoadJson(JsonDocument &d) {
   dash.v[DV_EC]  = dashFmt(d["EC"] | "--", 0, "uS");
   dash.v[DV_PH]  = dashFmt(d["PH"] | "--", 1, "");
   dash.v[DV_RAD] = dashFmt(d["RAD"] | "--", 0, "W");
+  dash.v[DV_LV]  = dashFmt(d["LV"] | "--", 0, "");
 }
 
 /* ---------- Dibujo ---------- */
@@ -2137,6 +2230,8 @@ void dashDraw() {
     dashRow(y, "PH", dash.v[DV_PH]); y += rowH;
   } else if (rs485Type == "RAD") {
     dashRow(y, "RAD", dash.v[DV_RAD]); y += rowH;
+  } else if (rs485Type == "LEVEL") {
+    dashRow(y, "NIV", dash.v[DV_LV]); y += rowH;
   }
   if (y == 25) dashText(0, y, "Sin sens.");
 
@@ -2190,11 +2285,97 @@ void oledInfoPage(const String &title, const String keys[], const String vals[],
   oled.display();
 }
 
+// Traducción de lastNetStatus (técnico, va al JSON/SD/serie) a texto para un
+// usuario básico en el OLED: rótulo corto (<=10), problema y qué hacer.
+struct NetFriendly {
+  const char *status;   // valor de lastNetStatus
+  const char *shortTxt; // <= 10 caracteres
+  const char *problem;
+  const char *advice;
+};
+
+static const NetFriendly NET_FRIENDLY[] = {
+  {"Modem sobrevoltaje", "VOLT ALTO", "Voltaje muy alto en el modem", "Revise el regulador del modem"},
+  {"Modem bajo voltaje", "BAT BAJA", "Bateria debil para el modem", "Cargue o cambie la bateria"},
+  {"Modem se apago", "BAT BAJA", "El modem se apago solo", "Cargue o cambie la bateria"},
+  {"Modem sin energia", "SIN MODEM", "El modem no enciende", "Revise la conexion del modem"},
+  {"Registro denegado", "ERROR SIM", "La red rechazo la SIM", "Revise la SIM y su saldo"},
+  {"Sin cobertura", "SIN SENAL", "No hay senal celular", "Revise la antena o mueva el equipo"},
+  {"Fallo GPRS", "SIN DATOS", "Sin internet movil", "Revise saldo de datos y APN"},
+  {"Fallo MQTT", "ERROR SERV", "El servidor no responde", "Se volvera a intentar luego"},
+  {"Fallo publicacion", "ERROR ENV", "No se pudo enviar el dato", "Se volvera a intentar luego"},
+};
+// Resto de causas "Modem ..." / "RX ..." / "TX ..." de modemDiagCause()
+static const NetFriendly NET_FRIENDLY_MODEM = {"", "SIN MODEM", "El modem no responde", "Revise cables y antena del modem"};
+
+const NetFriendly *netFriendly(const char *status) {
+  if (!status || !status[0]) return nullptr;
+  for (const NetFriendly &f : NET_FRIENDLY)
+    if (strcmp(status, f.status) == 0) return &f;
+  if (strncmp(status, "Modem", 5) == 0 || strncmp(status, "RX ", 3) == 0 || strncmp(status, "TX ", 3) == 0)
+    return &NET_FRIENDLY_MODEM;
+  return nullptr;  // éxito u otro texto ya legible ("Enviado OK (LTE)")
+}
+
+// Texto corto para el dashboard: el rótulo amigable si es un fallo conocido.
+String netStatusShort(const char *status) {
+  const NetFriendly *f = netFriendly(status);
+  return f ? String(f->shortTxt) : String(status);
+}
+
 // Resultado de la conectividad de este ciclo: se muestra y queda guardado
 // en memoria RTC para la consulta de estado posterior.
 void setNetStatus(const char *msg) {
   strlcpy(lastNetStatus, msg, sizeof(lastNetStatus));
-  oledLog(msg);
+  oledLog(netStatusShort(msg));
+}
+
+// Dibuja text partido en palabras a 10 columnas desde y; devuelve la y
+// siguiente. No pasa de yMax.
+int oledWrap(int y, const String &text, int yMax) {
+  String rest = text;
+  rest.trim();
+  while (rest.length() && y <= yMax) {
+    int cut = rest.length() <= 10 ? rest.length() : rest.lastIndexOf(' ', 10);
+    if (cut <= 0) cut = min((int)rest.length(), 10);
+    dashText(0, y, rest.substring(0, cut));
+    rest = rest.substring(cut);
+    rest.trim();
+    y += 9;
+  }
+  return y;
+}
+
+// Página amigable del resultado del modem: qué pasó y qué hacer, sin datos
+// técnicos (esos están en drawModemDiagPage()).
+void drawModemFriendlyPage(const String &footer) {
+  if (!oledReady) return;
+  const int W = oled.width();
+  const NetFriendly *f = netFriendly(lastNetStatus);
+  oled.clearDisplay();
+  oled.fillRect(0, 0, W, 10, SSD1306_WHITE);
+  dashText(1, 1, f ? "SIN ENVIO" : "MODEM", true);
+  const int yMax = footer.length() ? 108 : 118;
+  int y = 13;
+  if (f) {
+    y = oledWrap(y, f->problem, yMax) + 4;
+    dashText(0, y, "Que hacer:");
+    y = oledWrap(y + 9, f->advice, yMax) + 4;
+    oledWrap(y, "Datos guardados", yMax);
+  } else if (lastNetStatus[0]) {
+    y = oledWrap(y, lastNetStatus, yMax) + 4;
+    if (strncmp(lastSignal, "CSQ ", 4) == 0) {
+      static const char *const quality[] = {"nula", "debil", "regular", "buena", "excelente"};
+      oledWrap(y, String("Senal ") + quality[csqToBars(atoi(lastSignal + 4))], yMax);
+    }
+  } else {
+    oledWrap(y, "Sin datos todavia", yMax);
+  }
+  if (footer.length()) {
+    oled.drawFastHLine(0, 118, W, SSD1306_WHITE);
+    dashText(0, 120, footer.substring(0, 10));
+  }
+  oled.display();
 }
 
 /* ---------- Botones (antirrebote + pulsación corta/larga) ---------- */
@@ -2291,9 +2472,20 @@ void drawConfigPage(int page, bool fresh) {
     dash.v[DV_EC]  = dashFmt(sensCache.rsEC, 0, "uS");
     dash.v[DV_PH]  = dashFmt(sensCache.rsPH, 1, "");
     dash.v[DV_RAD] = dashFmt(sensCache.rsRad, 0, "W");
-    dash.step = serverReady ? "AP LISTO" : "INICIANDO";
-    dash.detail[0] = WiFi.softAPIP().toString();
-    dash.detail[1] = "Clientes " + String(WiFi.softAPgetStationNum());
+    dash.v[DV_LV]  = dashFmt(sensCache.rsLv, 0, "");
+    // Alterna cada 3 s entre el estado del AP y la MAC del equipo (para
+    // identificarlo: es el sufijo del topic de config). La MAC no cabe en
+    // 10 columnas, va en dos mitades "AA:BB:CC" / "DD:EE:FF".
+    if ((millis() / 3000) % 2) {
+      String mac = macA();
+      dash.step = "MAC";
+      dash.detail[0] = mac.substring(0, 8);
+      dash.detail[1] = mac.substring(9);
+    } else {
+      dash.step = serverReady ? "AP LISTO" : "INICIANDO";
+      dash.detail[0] = WiFi.softAPIP().toString();
+      dash.detail[1] = "Clientes " + String(WiFi.softAPgetStationNum());
+    }
     dash.stepIdx = dash.stepTotal;
     dashDraw();
     return;
@@ -2305,14 +2497,14 @@ void drawConfigPage(int page, bool fresh) {
     oledInfoPage("RED", k, v, 8, footer);
     return;
   }
-  String k[] = {"Fecha", "Hora", "SD", "MAC", "RS485"};
+  // MAC completa en dos filas (12 hex no caben en 10 columnas)
+  String k[] = {"Fecha", "Hora", "SD", "MAC", "", "RS485"};
   String ts = formatTimestamp(getEpochNow());  // AAAA-MM-DDTHH:MM:SS
   String mac = macA();
-  mac.replace(":", "");
   String v[] = {ts.substring(0, 10), ts.substring(11, 19),
                 sdReady ? String((unsigned long)sdFreeMB) + "MB" : "no",
-                mac, rs485Type};
-  oledInfoPage("SISTEMA", k, v, 5, footer);
+                mac.substring(0, 8), mac.substring(9), rs485Type};
+  oledInfoPage("SISTEMA", k, v, 6, footer);
 }
 
 // Llamada en cada vuelta de loop() en modo configuración.
@@ -2368,8 +2560,9 @@ void configOledTask() {
 }
 
 /* ---------- Consulta de estado (wakeup EXT0 por botón "ok") ---------- */
-// 0 = dashboard | 1 = conectividad | 2 = sistema | 3 = diagnóstico del modem
-#define STATUS_PAGES 4
+// 0 = dashboard | 1 = conectividad | 2 = sistema | 3 = modem (amigable)
+// 4 = modem (detalle técnico)
+#define STATUS_PAGES 5
 
 void drawStatusPage(int page, int pending) {
   const String footer = "OK2s:medir";
@@ -2378,7 +2571,7 @@ void drawStatusPage(int page, int pending) {
 
   if (page == 0) {
     dash.step = "PROX " + String(next) + "s";
-    dashSetDetail(lastNetStatus[0] ? lastNetStatus : "Sin datos");
+    dashSetDetail(lastNetStatus[0] ? netStatusShort(lastNetStatus) : String("Sin datos"));
     dash.stepTotal = 0;  // sin barra de progreso en esta vista
     dashDraw();
     return;
@@ -2394,7 +2587,11 @@ void drawStatusPage(int page, int pending) {
     return;
   }
   if (page == 3) {
-    drawModemDiagPage(footer);
+    drawModemFriendlyPage(footer);
+    return;
+  }
+  if (page == 4) {
+    drawModemDiagPage(footer);  // detalle técnico (para el técnico)
     return;
   }
   static String brownouts = readFile(SPIFFS, "/brownouts.txt");
@@ -2569,8 +2766,42 @@ uint64_t getRtcTimeSeconds() {
   return rtc_ticks / rtc_freq;
 }
 
+// Aviso breve de una vaciada en el OLED (si /oledOp.txt lo permite). Pensado
+// para el wake EXT1, que se repite con cada vaciada: ~0.1 s de arranque del
+// panel + RAIN_OLED_MS en pantalla, a 80 MHz, y v_sensor se corta de nuevo en
+// sleepRemainingCycle(). No se encienden sensores ni se leen archivos extra.
+#define RAIN_OLED_MS 700
+void rainOledFlash(int rain) {
+  if (readFile(SPIFFS, "/oledOp.txt") == "0") return;
+  sensorsRailOn();
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if (!oledInit()) return;
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(14, 20);
+  oled.print("LLUVIA");
+  oled.setTextSize(3);
+  oled.setCursor(14, 44);
+  oled.print("+1");
+  String n = String(rain);
+  oled.setTextSize(n.length() <= 5 ? 2 : 1);
+  int w = n.length() * 6 * (n.length() <= 5 ? 2 : 1);
+  oled.setCursor((64 - w) / 2, 86);
+  oled.print(n);
+  oled.setTextSize(1);
+  oled.setCursor(8, 106);
+  oled.print("vaciadas");
+  oled.display();
+  delay(RAIN_OLED_MS);
+  // El panel lo apaga sleepRemainingCycle(); si el período venció y se pasa
+  // a init_running(), sigue encendido para el dashboard del ciclo.
+}
+
 void runRainCounter() {
   Serial.println("\n[RAIN] ===== PULSO DE LLUVIA =====");
+  Serial.flush();
+  setCpuFrequencyMhz(80);  // este wake solo cuenta (y avisa en el OLED)
 
   // El wakeup EXT1 (ESP_EXT1_WAKEUP_ALL_LOW) solo dispara si el pin ya
   // estaba en LOW (campo presente), así que el pulso es real por
@@ -2589,8 +2820,9 @@ void runRainCounter() {
   bool intervalOk = (lastRainPulseRtcTicks == 0) ||
                      ((nowTicks - lastRainPulseRtcTicks) > minIntervalTicks);
 
+  int rain = -1;
   if (intervalOk) {
-    int rain = readFile(SPIFFS, "/ssidRainCounter.txt").toInt();
+    rain = readFile(SPIFFS, "/ssidRainCounter.txt").toInt();
     rain++;
     writeFile(SPIFFS, "/ssidRainCounter.txt", String(rain).c_str());
     lastRainPulseRtcTicks = nowTicks;
@@ -2610,6 +2842,8 @@ void runRainCounter() {
   while (analogReadMilliVolts(RAINCOUNT) < RAIN_ADC_IDLE_MV && (millis() - start) < 100) {
     delayMicroseconds(500);
   }
+
+  if (rain >= 0) rainOledFlash(rain);
 
   sleepRemainingCycle();  // No retorna, entra en deep sleep
 }
@@ -2670,6 +2904,7 @@ void sleepRemainingCycle() {
   // RX2/TX2 a LOW: evita retroalimentar el SIM800 por los pines UART
   // mientras está sin alimentación (ver modemLinesOff()).
   modemLinesOff();
+  rs485RailOff();
 
   gpio_hold_dis((gpio_num_t)SENS_PWR_PIN);
   pinMode(SENS_PWR_PIN, OUTPUT);
@@ -2831,10 +3066,12 @@ float windCal(float raw) {
 
 /* ---------- Muestreo múltiple (modo operación) ---------- */
 #define TH_SAMPLES            3
+#define DHT_WARMUP_MS         4500   // riel ON -> lectura de descarte (2.5 s arranque frío + 2 s de initDHT22)
 #define TH_INTERVAL_MS        1100   // lectura forzada (el DHT21 nominal es 2 s; ver readDHT22())
 #define WIND_SAMPLES          2      // ventanas de velocidad + muestras de dirección
 #define RS485_SAMPLES         2
 #define WD_MAX_SPREAD_DEG     36.0f  // 10 % de 360°: dispersión máxima entre las muestras
+#define WD_OSC_SPREAD_DEG     90.0f  // 25 % de 360°: rango ampliado con mucha oscilación
 #define WD_EXTRA_SAMPLES      6      // muestras extra si las 3 primeras no son estables
 #define WD_EXTRA_INTERVAL_MS  500
 
@@ -2868,14 +3105,43 @@ float angularSpread(const float *deg, int n) {
   return maxD;
 }
 
+// Grupo más grande de muestras que caben en un arco de maxSpread grados
+// (todas a <= maxSpread/2 de una muestra central). Todo con angleDiff(), así
+// 359° y 0° cuentan como vecinas (ambas apuntan al norte) y el grupo puede
+// cruzar el norte sin problema. Deja los índices en idx y devuelve cuántas.
+int largestAngularCluster(const float *deg, int n, float maxSpread, int *idx) {
+  int best = 0;
+  float bestSpread = 361.0f;
+  int cand[WIND_SAMPLES + WD_EXTRA_SAMPLES];
+  float sel[WIND_SAMPLES + WD_EXTRA_SAMPLES];
+  for (int c = 0; c < n; c++) {
+    int m = 0;
+    for (int j = 0; j < n; j++)
+      if (angleDiff(deg[j], deg[c]) <= maxSpread / 2.0f) cand[m++] = j;
+    for (int k = 0; k < m; k++) sel[k] = deg[cand[k]];
+    float sp = angularSpread(sel, m);
+    // Más muestras gana; a igual cantidad, el grupo más compacto
+    if (m > best || (m == best && sp < bestSpread)) {
+      best = m;
+      bestSpread = sp;
+      memcpy(idx, cand, m * sizeof(int));
+    }
+  }
+  return best;
+}
+
 // Viento: WIND_SAMPLES ventanas de 3 s de velocidad (cada una calibrada
 // con windCal() y luego promediadas, así una ventana sin pulsos aporta 0
 // y no la ordenada al origen) y una muestra de dirección al final de cada
-// ventana. Si las direcciones se dispersan más de WD_MAX_SPREAD_DEG se
-// toman muestras extra y se usan las WIND_SAMPLES últimas consecutivas
-// que cumplan; si nunca se estabiliza (viento
-// racheado/variable) se reporta el promedio circular de todas las muestras,
-// que sigue siendo un rumbo coherente aunque menos representativo.
+// ventana. La dirección se decide en tres niveles:
+//   1. ESTABLE: las WIND_SAMPLES últimas consecutivas caben en
+//      WD_MAX_SPREAD_DEG (10 %); si no, se toman hasta WD_EXTRA_SAMPLES más.
+//   2. OSCILANTE: si nunca se estabiliza, se amplía el rango a
+//      WD_OSC_SPREAD_DEG (25 %) y se promedia el grupo más grande de
+//      muestras que caben en ese arco (descarta las ráfagas aisladas que
+//      apuntan a otro lado), si reúne más de la mitad de las muestras.
+//   3. VARIABLE: si ni así, promedio circular de todas las muestras.
+// Todas las comparaciones y promedios son circulares: 359° y 0° están a 1°.
 void readWindAveraged(float &speed, bool &speedOk, float &dir, bool &dirStable) {
   float sum = 0;
   int nSpeed = 0;
@@ -2904,10 +3170,23 @@ void readWindAveraged(float &speed, bool &speedOk, float &dir, bool &dirStable) 
   if (dirStable) {
     dir = circularMean(&dirs[nDir - WIND_SAMPLES], WIND_SAMPLES);
     Serial.printf("[WIND] Dirección estable (dispersión %.1f°): %.1f°\n", spread, dir);
+    return;
+  }
+
+  // Nivel 2: rango ampliado al 25 %
+  int idx[WIND_SAMPLES + WD_EXTRA_SAMPLES];
+  int n = largestAngularCluster(dirs, nDir, WD_OSC_SPREAD_DEG, idx);
+  // El grupo debe ser mayoría: 3 de 8 en un arco no definen un rumbo
+  if (n >= WIND_SAMPLES && 2 * n > nDir) {
+    float sel[WIND_SAMPLES + WD_EXTRA_SAMPLES];
+    for (int k = 0; k < n; k++) sel[k] = dirs[idx[k]];
+    dir = circularMean(sel, n);
+    Serial.printf("[WIND] Dirección oscilante: %d/%d muestras dentro de %.0f° (dispersión %.1f°): %.1f°\n",
+                  n, nDir, WD_OSC_SPREAD_DEG, angularSpread(sel, n), dir);
   } else {
     dir = circularMean(dirs, nDir);
     Serial.printf("[WIND] Dirección variable (%d muestras, dispersión >%.0f°): promedio vectorial %.1f°\n",
-                  nDir, WD_MAX_SPREAD_DEG, dir);
+                  nDir, WD_OSC_SPREAD_DEG, dir);
   }
 }
 
@@ -2959,6 +3238,7 @@ void modemRailOn() {
 #endif
   pinMode(MODEM_PWR_PIN, OUTPUT);
   digitalWrite(MODEM_PWR_PIN, MODEM_PWR_ON);
+  modemRailOnMs = millis();
 }
 
 void modemStepSet(const char *step) {
@@ -3033,17 +3313,26 @@ void oledRecover() {
   oled.setTextWrap(false);
 }
 
-// Paso de la secuencia de diagnóstico del modem: se muestra en la línea
-// MODEM del dashboard (+ 2 líneas de detalle) y se guarda en modemStep
-// (RTC_NOINIT) ANTES de ejecutar la acción, así si el ESP32 se cuelga o
-// se reinicia queda visible / se recuerda el último paso alcanzado.
-void mdiagShow(const String &line, const String &d0 = "", const String &d1 = "") {
-  Serial.printf("[MODEM] %s | %s %s\n", line.c_str(), d0.c_str(), d1.c_str());
-  modemStepSet(line.c_str());
-  dash.modem = line;
-  dash.detail[0] = d0;
-  dash.detail[1] = d1;
-  if (oledReady) dashDraw();
+// Paso de la secuencia del modem. code (p.ej. "M4 SYNC") y tech (valores
+// técnicos) van solo al serie y a modemStep (RTC_NOINIT, guardado ANTES de
+// ejecutar la acción: si el ESP32 se reinicia se recuerda el último paso).
+// En el OLED solo se muestra msg, un texto simple para un usuario básico
+// (<= 20 caracteres, palabras de <= 10).
+void mdiagShow(const String &code, const String &msg, const String &tech = "") {
+  Serial.printf("[MODEM] %s | %s | %s\n", code.c_str(), msg.c_str(), tech.c_str());
+  modemStepSet(code.c_str());
+  if (oledReady) {
+    dashSetDetail(msg);
+    dashDraw();
+  }
+}
+
+// Espera del modem en el OLED: texto + segundos transcurridos.
+void mdiagShowWait(const char *l0, const char *l1, uint32_t t0) {
+  if (!oledReady) return;
+  dash.detail[0] = l0;
+  dash.detail[1] = String(l1) + " " + String((millis() - t0) / 1000) + "s";
+  dashDraw();
 }
 
 // Procesa un byte recibido del modem: cuenta, guarda la cola imprimible y
@@ -3114,8 +3403,8 @@ bool mdiagProbe(const char *line, uint32_t baud, int tries) {
   while (SerialAT.available()) mdiagFeed((char)SerialAT.read());
   mdiagSawOK = false;
   for (int i = 0; i < tries && !mdiagSawOK; i++) {
-    mdiagShow(line, "intento " + String(i + 1) + "/" + String(tries),
-              String(mdiag.rxBytes) + "B rx");
+    mdiagShow(line, "Revisando modem",
+              "intento " + String(i + 1) + "/" + String(tries) + " " + String(mdiag.rxBytes) + "B rx");
     SerialAT.print("AT\r\n");
     mdiagPump(600);
   }
@@ -3153,7 +3442,9 @@ bool modemStabilize() {
   uint32_t t0 = millis();
   int n = 0;
   while (!mdiagSawOK && millis() - t0 < MODEM_SYNC_MS) {
-    mdiagShow("M4 SYNC", "AT #" + String(++n), String((millis() - t0) / 1000) + "s " + String(mdiag.rxBytes) + "B");
+    Serial.printf("[MODEM] M4 SYNC AT #%d %lus %uB\n", ++n, (unsigned long)((millis() - t0) / 1000), mdiag.rxBytes);
+    modemStepSet("M4 SYNC");
+    mdiagShowWait("Conectando", "modem", t0);
     SerialAT.print("AT\r\n");
     mdiagPump(500);
   }
@@ -3171,11 +3462,9 @@ bool modemStabilize() {
     mdiagPump(100);
     if (mdiag.rxBytes != prev) { prev = mdiag.rxBytes; lastRx = millis(); }
     if (millis() - lastRx >= MODEM_QUIET_MS && millis() - t0 >= MODEM_QUIET_MS) break;
-    if (oledReady && (millis() - t0) % 500 < 100) {
-      dash.modem = "M5 ESPERA";
-      dash.detail[0] = String((millis() - t0) / 1000) + "s " + String(mdiag.rxBytes) + "B";
-      dash.detail[1] = mdiag.urc[0] ? String(mdiag.urc) : String("err ") + mdiag.badBytes;
-      dashDraw();
+    if ((millis() - t0) % 500 < 100) {
+      modemStepSet("M5 ESPERA");
+      mdiagShowWait("Preparando", "modem", t0);
     }
   }
   Serial.printf("[MODEM] Arranque terminado en %lu ms (%s)\n", (unsigned long)(millis() - t0),
@@ -3193,8 +3482,9 @@ bool modemStabilize() {
     total++;
     if (mdiagSawOK && mdiag.badBytes == badBefore) good++;
     else good = 0;
-    mdiagShow("M6 ESTABLE", "OK " + String(good) + "/" + String(MODEM_STABLE_OK),
-              "AT" + String(total) + " err" + String(mdiag.badBytes));
+    mdiagShow("M6 ESTABLE", "Probando modem",
+              "OK " + String(good) + "/" + String(MODEM_STABLE_OK) + " AT" + String(total) +
+              " err" + String(mdiag.badBytes));
     delay(300);
   }
   Serial.printf("[MODEM] Enlace %s: %d OK seguidos en %d AT, %u bytes corruptos\n",
@@ -3209,7 +3499,7 @@ bool modemStabilize() {
 // entre intentos). Devuelve true si alguno funcionó.
 bool modemInitRetries() {
   for (int i = 1; i <= MODEM_INIT_TRIES; i++) {
-    mdiagShow("M7 INIT " + String(i), "modem.init", "err " + String(mdiag.badBytes));
+    mdiagShow("M7 INIT " + String(i), "Activando modem", "err " + String(mdiag.badBytes));
     if (modem.init()) return true;
     Serial.printf("[MODEM] init %d/%d falló\n", i, MODEM_INIT_TRIES);
     mdiagPump(2000);
@@ -3231,10 +3521,10 @@ void modemDiagProbeAT() {
   SerialAT.updateBaudRate(UART_BAUD);
   delay(50);
   if (ok) {
-    mdiagShow("D AT OK", mdiagBaudTxt(mdiag.atBaud), String(mdiag.rxBytes) + "B rx");
+    mdiagShow("D AT OK", "Revisando modem", mdiagBaudTxt(mdiag.atBaud) + " " + String(mdiag.rxBytes) + "B rx");
   } else {
     Serial.println("[MODEM] Sin respuesta AT a ningún baudrate");
-    mdiagShow("D AT NO", String(mdiag.rxBytes) + "B rx", mdiagHexTxt());
+    mdiagShow("D AT NO", "Modem no responde", String(mdiag.rxBytes) + "B rx " + mdiagHexTxt());
   }
 }
 
@@ -3295,34 +3585,45 @@ void drawModemDiagPage(const String &footer) {
   oledInfoPage("MODEM", k, v, 9, footer);
 }
 
-// Fallo del envío LTE: guarda el paso, registra en SD y deja la página de
-// diagnóstico en pantalla hasta 20 s (OK o UP la cierran antes).
+// Fallo del envío LTE: guarda el paso, registra en SD y deja en pantalla
+// hasta 20 s la página amigable (qué pasó / qué hacer). UP alterna con el
+// detalle técnico; OK la cierra antes.
 void modemDiagFail(const char *step) {
   strlcpy(mdiag.step, step, sizeof(mdiag.step));
   modemDiagLogSD();
-  dash.modem = String("X ") + step;
+  dash.modem = netStatusShort(lastNetStatus).substring(0, 10);
   modemStepSet("");
   if (!oledReady) return;
-  drawModemDiagPage("OK:seguir");
-  pinMode(BTN_OK_PIN, INPUT);  // pull-up externo 100k
-  pinMode(BTN_UP_PIN, INPUT);
+  buttonsInit();
+  bool tech = false;
+  drawModemFriendlyPage("UP:detalle");
   uint32_t t0 = millis();
-  delay(300);
   while (millis() - t0 < 20000) {
-    if (digitalRead(BTN_OK_PIN) == LOW || digitalRead(BTN_UP_PIN) == LOW) break;
+    if (pollButton(btnOk) != BTN_NONE) break;
+    if (pollButton(btnUp) != BTN_NONE) {
+      tech = !tech;
+      t0 = millis();  // más tiempo para leer
+      if (tech) drawModemDiagPage("OK:seguir");
+      else drawModemFriendlyPage("UP:detalle");
+    }
     delay(20);
   }
 }
 
-void modemPowerOn() {
+// Encendido en dos fases para poder aprovechar los MODEM_BOOT_MS de arranque
+// (UART cerrado) en otra cosa, p.ej. leer el sensor RS485 que comparte riel:
+//   modemPowerOnBegin()  riel ON + mediciones pasivas (vuelve enseguida)
+//   modemPowerOnFinish() completa MODEM_BOOT_MS contados desde el riel ON y
+//                        abre el UART. Misma secuencia eléctrica que antes.
+void modemPowerOnBegin() {
   Serial.println("[MODEM] Encendiendo SIM800...");
   modemStepSet("Encendido");
   mdiag.attempts++;
   mdiagSawReady = false;  // cada encendido vuelve a esperar su "SMS Ready"
   mdiag.vBat0 = vBatQuick();
   mdiagTrackBat();
-  mdiagShow("M1 BATERIA", "Vb " + String(mdiag.vBat0, 2) + "V",
-            "intento " + String(mdiag.attempts));
+  mdiagShow("M1 BATERIA", "Revisando bateria",
+            "Vb " + String(mdiag.vBat0, 2) + "V intento " + String(mdiag.attempts));
   modemBrownoutRideThrough(true);
 
   // Liberar el hold LOW de RX2/TX2 antes de que begin() los reconfigure
@@ -3338,31 +3639,38 @@ void modemPowerOn() {
   delay(5);
   mdiag.rxPre = digitalRead(PIN_RX2);
 
-  modemPoweredOn = true;  // antes de la espera: ver rs485PowerOff()
-  mdiagShow("M2 RIEL ON", "RX apag " + String(mdiag.rxPre), "directo");
+  modemPoweredOn = true;
+  mdiagShow("M2 RIEL ON", "Prendiendo modem", "RX apag " + String(mdiag.rxPre));
   modemRailOn();
   delay(150);
   mdiag.rxOn = digitalRead(PIN_RX2);
   pinMode(PIN_RX2, INPUT);
   oledRecover();
+}
 
+void modemPowerOnFinish() {
   // Como PROD (a603f7a), pero MODEM_BOOT_MS: arranque con el UART CERRADO y recién
   // entonces SerialAT.begin(). Abrirlo antes captura basura/URC de arranque
   // que luego se mezclan con las respuestas de modem.init(). Durante la
   // espera solo se mide (batería, nivel de RX): nada se envía al modem.
-  uint32_t t0 = millis();
+  // Se cuenta desde el riel ON: si entretanto se leyó el RS485, solo se
+  // espera lo que falta.
+  uint32_t t0 = modemRailOnMs;
   while (millis() - t0 < MODEM_BOOT_MS) {
     mdiagTrackBat();
-    if (oledReady) {
-      dash.modem = "M3 ARRANQ";
-      dash.detail[0] = "Bmin " + String(mdiag.vBatMin, 2);
-      dash.detail[1] = "RX" + String(digitalRead(PIN_RX2)) + " " + String((millis() - t0) / 1000) + "s";
-      dashDraw();
-    }
+    modemStepSet("M3 ARRANQ");
+    mdiagShowWait("Arrancando", "modem", t0);
     delay(250);
   }
   mdiag.rxLevel = digitalRead(PIN_RX2);  // idle HIGH = TX del modem energizado
   oledRecover();
+
+  // La sesión con el modem corre a 240 MHz como PROD (a603f7a); el resto del
+  // ciclo (sensores, SD) va a 80 MHz. Vaciar el log antes de cambiar.
+  if (getCpuFrequencyMhz() != 240) {
+    Serial.flush();
+    setCpuFrequencyMhz(240);
+  }
 
   SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX2, PIN_TX2);
   // Pad TX en reposo (el UART lo deja en HIGH): 0 = línea cargada/en corto
@@ -3373,9 +3681,24 @@ void modemPowerOn() {
   Serial.printf("[MODEM] SIM800 encendido: Vbat %.2f->%.2f V, RX %d>%d>%d, TX %d\n",
                 mdiag.vBat0, mdiag.vBatMin, mdiag.rxPre, mdiag.rxOn, mdiag.rxLevel, mdiag.txIdle);
   mdiagShow(mdiag.rxLevel ? "M3 RX ALTO" : "M3 RX BAJO",
-            "Bmin " + String(mdiag.vBatMin, 2),
-            "RX " + String(mdiag.rxPre) + ">" + String(mdiag.rxOn) + ">" + String(mdiag.rxLevel) +
-            " TX" + String(mdiag.txIdle));
+            mdiag.rxLevel ? "Modem encendido" : "Modem sin energia?",
+            "Bmin " + String(mdiag.vBatMin, 2) + " RX " + String(mdiag.rxPre) + ">" + String(mdiag.rxOn) +
+            ">" + String(mdiag.rxLevel) + " TX" + String(mdiag.txIdle));
+}
+
+void modemPowerOn() {
+  modemPowerOnBegin();
+  modemPowerOnFinish();
+}
+
+// Inicio de la sesión LTE del ciclo: limpia el diagnóstico y enciende el riel
+// (fase 1). Lo llama sendDataLTE().
+void modemSessionBegin() {
+  dashStep("MODEM");
+  lastSignal[0] = '\0';
+  mdiagReset();
+  lastModemMv = -1;
+  modemPowerOnBegin();
 }
 
 void modemPowerOff() {
@@ -3424,6 +3747,7 @@ struct Rs485Data {
   float soilT = 0, soilH = 0, ph = 0;
   int ec = 0;
   int rad = 0;
+  float level = 0;  // ACLT600, crudo promediado
 };
 
 // CRC-16/MODBUS (polinomio 0xA001, inicial 0xFFFF). En la trama va el byte
@@ -3497,36 +3821,103 @@ bool modbusReadRegs(uint32_t baud, uint8_t addr, uint16_t reg, uint16_t count, u
   return false;
 }
 
-// Energiza el 12V del sensor (sim_control). Devuelve true si este llamado
-// lo encendió y por tanto debe apagarlo; si el modem ya estaba encendido
-// (p.ej. /ltetest en curso) no se toca.
-bool rs485PowerOn() {
-  if (modemPoweredOn) return false;
-  // El SIM800 arranca a la par: RX2 como entrada para que su TX en reposo
-  // (HIGH) no pelee contra el LOW forzado por modemLinesOff().
-  gpio_hold_dis((gpio_num_t)PIN_RX2);
-  pinMode(PIN_RX2, INPUT);
-  modemRailOn();
+// 12V del sensor RS485 por GPIO14, independiente del modem: leer el sensor
+// ya no enciende el SIM800.
+void rs485RailOn() {
+  gpio_hold_dis((gpio_num_t)RS485_PWR_PIN);
+  pinMode(RS485_PWR_PIN, OUTPUT);
+  digitalWrite(RS485_PWR_PIN, RS485_PWR_ON);
+  rs485RailOnMs = millis();
+}
+
+// Apaga el 12V y retiene el nivel (deep sleep incluido).
+void rs485RailOff() {
+  gpio_hold_dis((gpio_num_t)RS485_PWR_PIN);
+  pinMode(RS485_PWR_PIN, OUTPUT);
+  digitalWrite(RS485_PWR_PIN, RS485_PWR_OFF);
+  gpio_hold_en((gpio_num_t)RS485_PWR_PIN);
+  rs485RailOnMs = 0;
+}
+
+// Una lectura del registro de nivel del ACLT600 (int16 con signo).
+bool readLevelOnce(int &raw) {
+  uint16_t r;
+  if (!modbusReadRegs(9600, RS485_SLAVE_ADDR, LEVEL_REG, 1, &r)) return false;
+  raw = (int16_t)r;
   return true;
 }
 
-void rs485PowerOff(bool owned) {
-  // Si mientras tanto se encendió el modem (/ltetest corre en otro hilo),
-  // el riel ya es suyo: no cortarlo.
-  if (!owned || modemPoweredOn) return;
-  digitalWrite(MODEM_PWR_PIN, MODEM_PWR_OFF);
-  gpio_hold_en((gpio_num_t)MODEM_PWR_PIN);
-  modemLinesOff();
+// Procedimiento del proyecto levelSIM7000 (probado con el ACLT600 real):
+// lecturas sucesivas hasta que LEVEL_STABLE_WINDOW seguidas varíen como mucho
+// LEVEL_STABLE_THRESHOLD (o se agote LEVEL_STABLE_MAX_TRIES), y luego el
+// promedio de LEVEL_AVG_SAMPLES lecturas finales. Diferencia: si la primera
+// lectura falla (sensor ausente) o fallan LEVEL_MAX_FAILS seguidas se aborta
+// enseguida — cada fallo ya cuesta varios reintentos + inversión TX/RX, y
+// seguir insistiendo dejaría el equipo despierto más de un minuto.
+// live (modo config): sin la fase de estabilidad, solo el promedio final.
+bool readLevel(float &avg, bool live) {
+  int window[LEVEL_STABLE_WINDOW];
+  int got = 0, fails = 0;
+  bool stable = live;
+
+  for (int i = 0; i < LEVEL_STABLE_MAX_TRIES && !stable; i++) {
+    if (i > 0) delay(LEVEL_SAMPLE_DELAY_MS);
+    int raw;
+    if (!readLevelOnce(raw)) {
+      if (got == 0 || ++fails >= LEVEL_MAX_FAILS) return false;
+      continue;
+    }
+    fails = 0;
+    window[got % LEVEL_STABLE_WINDOW] = raw;
+    got++;
+    Serial.printf("[RS485] Nivel crudo (estabilizando %d): %d\n", i + 1, raw);
+    if (got >= LEVEL_STABLE_WINDOW) {
+      int mn = window[0], mx = window[0];
+      for (int k = 1; k < LEVEL_STABLE_WINDOW; k++) {
+        mn = min(mn, window[k]);
+        mx = max(mx, window[k]);
+      }
+      stable = (mx - mn) <= LEVEL_STABLE_THRESHOLD;
+    }
+  }
+  if (!stable) Serial.println("[RS485] Nivel sin estabilizar en el tope de intentos, se promedia igual");
+
+  long sum = 0;
+  int n = 0;
+  int samples = live ? RS485_SAMPLES : LEVEL_AVG_SAMPLES;
+  for (int i = 0; i < samples; i++) {
+    delay(LEVEL_SAMPLE_DELAY_MS);
+    int raw;
+    if (readLevelOnce(raw)) {
+      sum += raw;
+      n++;
+    } else if (n == 0 && got == 0) {
+      return false;  // modo live: sensor ausente
+    }
+  }
+  if (n == 0) return false;
+  avg = (float)sum / n;
+  Serial.printf("[RS485] Nivel promedio: %.1f (crudo, %d muestras)\n", avg, n);
+  return true;
 }
 
 // Lee el sensor elegido en rs485Type. Requiere v_sensor encendido (módulo
-// TTL-RS485).
-bool readRS485(Rs485Data &d) {
+// TTL-RS485). live (modo config, cada 30 s): el 12V queda encendido entre
+// lecturas para no repetir el calentamiento (se corta al dormir/reiniciar),
+// y el nivel se lee sin la fase de estabilización.
+bool readRS485(Rs485Data &d, bool live) {
   if (rs485Type == "NONE" || rs485Busy) return false;
   rs485Busy = true;
 
-  bool owned = rs485PowerOn();
-  if (owned) delay(RS485_WARMUP_MS);
+  // En modo config el 12V puede seguir encendido de la lectura anterior.
+  if (!rs485RailOnMs) rs485RailOn();
+  // Elevador 12V + arranque del sensor (el ACLT600 tarda ~10 s)
+  if (rs485Type == "LEVEL") {
+    if (!live) oledLog("nivel: arranque 10s");
+    waitSince(rs485RailOnMs, LEVEL_WARMUP_MS);
+  } else {
+    waitSince(rs485RailOnMs, RS485_WARMUP_MS);
+  }
 
   uint16_t r[4];
   bool ok = false;
@@ -3577,10 +3968,12 @@ bool readRS485(Rs485Data &d) {
       d.rad = (int)((sum + n / 2) / n);
       Serial.printf("[RS485] Radiación promedio (%d/%d): %d W/m2\n", n, RS485_SAMPLES, d.rad);
     }
+  } else if (rs485Type == "LEVEL") {
+    ok = readLevel(d.level, live);
   }
   if (!ok) Serial.println("[RS485] Sensor sin respuesta");
 
-  rs485PowerOff(owned);
+  if (!live) rs485RailOff();
   rs485Busy = false;
   return ok;
 }
@@ -3593,7 +3986,7 @@ bool configReceivedFlag = false;
 void callback(char *topic, byte *payload, unsigned int length) {
   Serial.printf("[CONFIG] Topic recibido: %s\n", topic);
 
-  // Extract MAC from end of topic: jhpAI/FAUNA/settings/AA:BB:CC:DD:EE:FF
+  // Extract MAC from end of topic: jhpAI/HIDROMET/settings/AA:BB:CC:DD:EE:FF
   String topicStr = String(topic);
   String macInTopic = topicStr.substring(topicStr.lastIndexOf('/') + 1);
   String deviceMac = macA();
@@ -3626,7 +4019,7 @@ void callback(char *topic, byte *payload, unsigned int length) {
   if (docIn.containsKey("oled"))      oledOpEnabled = docIn["oled"].as<bool>();
   if (docIn.containsKey("rs485")) {
     String v = docIn["rs485"].as<String>();
-    rs485Type = (v == "SOIL" || v == "RAD") ? v : "NONE";
+    rs485Type = rs485Norm(v);
   }
 
   saveSetting(status ? "1" : "0",         "/status.txt");
@@ -3741,10 +4134,13 @@ void wakeup_reason() {
 String readSensors() {
   Serial.println("\n[SENSORS] Iniciando lectura de sensores...");
 
-  // Encender sensores: MOSFET canal P gate LOW = ON
-  pinMode(SENS_PWR_PIN, OUTPUT);
-  digitalWrite(SENS_PWR_PIN, LOW);
-  delay(2500);  // AM2301 necesita ≥2.5 s de arranque frío tras encender v_sensor
+  // Encender sensores: MOSFET canal P gate LOW = ON. El calentamiento del
+  // AM2301 (DHT_WARMUP_MS) se cuenta desde aquí (o desde antes, si el OLED
+  // ya encendió el riel) y se solapa con la medición de viento, en vez de
+  // esperarlo sin hacer nada.
+  sensorsRailOn();
+  const uint32_t railMs = sensRailOnMs;
+  waitSince(railMs, 100);  // encoder / DS3231 / sensor Hall
 
   // Iniciar I2C una sola vez — lo usan el MT6701/AS5600 (si A_WS) y siempre
   // el DS3231 (marca de tiempo), así que ya no se condiciona a A_WS.
@@ -3760,10 +4156,27 @@ String readSensors() {
   docOut["BO"] = readFile(SPIFFS, "/brownouts.txt").toInt();  // brownouts acumulados (diagnóstico de alimentación)
   docOut["timestamp"] = formatTimestampISO8601(getEpochNow());
 
+  // ===== VIENTO: se mide primero, mientras el AM2301 se calienta =====
+  float wv = 0, wd = 0;
+  bool wvOk = false, wdStable = false;
+  if (A_TH) dht.begin();
+  if (A_WS) {
+    Serial.println("[SENSOR] Leyendo viento...");
+    oledLog("viento " + String(WIND_SAMPLES) + "x3s");
+    initMT6701();
+    readWindAveraged(wv, wvOk, wd, wdStable);  // ya calibrada (windCal)
+  }
+
   // ===== TEMPERATURA Y HUMEDAD (DHT22) =====
   if (A_TH) {
     Serial.println("[SENSOR] Leyendo DHT22...");
-    initDHT22();
+    // Mismos tiempos que initDHT22() (2.5 s de arranque frío + 2 s, lectura
+    // de descarte, 2 s), pero contados desde el encendido del riel: con el
+    // viento activado la espera ya transcurrió.
+    waitSince(railMs, DHT_WARMUP_MS);
+    dht.readTemperature();  // la primera tras power-on trae valores de arranque
+    dht.readHumidity();
+    delay(2000);
 
     // TH_SAMPLES lecturas válidas promediadas (máx. el doble de intentos),
     // cada TH_INTERVAL_MS con lectura forzada.
@@ -3806,16 +4219,8 @@ String readSensors() {
     }
   }
 
-  // ===== VELOCIDAD Y DIRECCIÓN DEL VIENTO =====
+  // ===== VELOCIDAD Y DIRECCIÓN DEL VIENTO (medidas arriba) =====
   if (A_WS) {
-    Serial.println("[SENSOR] Leyendo viento...");
-    oledLog("viento " + String(WIND_SAMPLES) + "x3s");
-
-    initMT6701();
-    float wv, wd;
-    bool wvOk, wdStable;
-    readWindAveraged(wv, wvOk, wd, wdStable);  // ya calibrada (windCal)
-
     float wvCal = wv;
 
     docOut["WV"] = wvOk ? String(wvCal, 2) : "error";
@@ -3848,7 +4253,7 @@ String readSensors() {
     Serial.printf("[SENSOR] Leyendo RS485 (%s)...\n", rs485Type.c_str());
     oledLog("RS485...");
     Rs485Data rs;
-    bool ok = readRS485(rs);
+    bool ok = readRS485(rs, false);
     if (rs485Type == "SOIL") {
       docOut["ST"] = ok ? String(rs.soilT, 1) : "error";
       docOut["SH"] = ok ? String(rs.soilH, 1) : "error";
@@ -3858,6 +4263,9 @@ String readSensors() {
       dash.v[DV_SH] = ok ? String(rs.soilH, 0) + "%" : "ERR";
       dash.v[DV_EC] = ok ? String(rs.ec) + "uS" : "ERR";
       dashSet(DV_PH, ok ? String(rs.ph, 1) : "ERR");
+    } else if (rs485Type == "LEVEL") {
+      docOut["LV"] = ok ? String(rs.level, 1) : "error";  // crudo promediado, sin escala
+      dashSet(DV_LV, ok ? String(rs.level, 0) : "ERR");
     } else {
       docOut["RAD"] = ok ? String(rs.rad) : "error";
       dashSet(DV_RAD, ok ? String(rs.rad) + "W" : "ERR");
@@ -3868,10 +4276,12 @@ String readSensors() {
   // Apagar sensores: MOSFET canal P gate HIGH = OFF. Si el OLED está
   // mostrando el ciclo, v_sensor (que también lo alimenta) sigue encendido
   // hasta deepSleepSystem().
-  if (!oledReady) digitalWrite(SENS_PWR_PIN, HIGH);
+  if (!oledReady) sensorsRailOff();
 
   // ===== BATERÍA =====
-  String bat = vBat();
+  // En operación se usa la medida en reposo de init_running() (tomada antes
+  // de encender el modem, que la hundiría); en el portal (/lognow), una nueva.
+  String bat = cycleBatV > 0 ? String(cycleBatV, 2) : vBat();
   docOut["vB"] = bat;
   Serial.printf("[SENSOR] Batería: %s V\n", bat.c_str());
 
@@ -3911,12 +4321,29 @@ bool waitForNetworkMonitored(uint32_t timeoutMs) {
   uint32_t start = millis();
   int16_t minMv = lastModemMv > 0 ? lastModemMv : 9999;
   int noAnswer = 0;
+  uint32_t lastDiag = 0;
+  bool firstDiag = true;
   while (millis() - start < timeoutMs) {
+    // CREG cada 1 s (antes 3 s): el registro se detecta hasta ~2 s antes, y
+    // cada segundo con el modem buscando red cuesta ~100 mA. El diagnóstico
+    // (CBC/CSQ/OLED) sigue cada 3 s.
     SIM800RegStatus st = modem.getRegistrationStatus();
     if (st == REG_OK_HOME || st == REG_OK_ROAMING) {
       if (minMv < 9999) lastModemMv = minMv;
       return true;
     }
+    if (st == REG_DENIED) {
+      Serial.println("[ERROR] Registro rechazado por la red (SIM/operador)");
+      setNetStatus("Registro denegado");
+      if (minMv < 9999) lastModemMv = minMv;
+      return false;
+    }
+    if (!firstDiag && millis() - lastDiag < 3000) {
+      delay(1000);
+      continue;
+    }
+    firstDiag = false;
+    lastDiag = millis();
     int16_t mv = modem.getBattVoltage();
     int csq = modem.getSignalQuality();
     mdiagTrackBat();
@@ -3925,14 +4352,9 @@ bool waitForNetworkMonitored(uint32_t timeoutMs) {
     Serial.printf("[LTE] t=%2lus CREG=%d CSQ=%d V=%d mV%s\n",
                   (unsigned long)((millis() - start) / 1000), (int)st, csq, mv,
                   (mv > 0 && mv < 3500) ? "  <-- BAJA" : "");
-    if (oledReady) {
-      dash.bars = csqToBars(csq);
-      dash.modem = "M8 CREG " + String((int)st);
-      dash.detail[0] = "CSQ " + String(csq) + " " + String((millis() - start) / 1000) + "s";
-      // S = tensión en el SIM800 (AT+CBC), B = batería mínima (ESP32)
-      dash.detail[1] = "S" + String(mv / 1000.0f, 2) + " B" + String(mdiag.vBatMin, 1);
-      dashDraw();
-    }
+    dash.bars = csqToBars(csq);  // las barras de señal ya informan la calidad
+    modemStepSet("M8 CREG");
+    mdiagShowWait("Buscando", "senal", start);
 
     if (st == REG_NO_RESULT && mv <= 0) {
       if (++noAnswer >= 2) {
@@ -3949,13 +4371,7 @@ bool waitForNetworkMonitored(uint32_t timeoutMs) {
     } else {
       noAnswer = 0;
     }
-    if (st == REG_DENIED) {
-      Serial.println("[ERROR] Registro rechazado por la red (SIM/operador)");
-      setNetStatus("Registro denegado");
-      if (minMv < 9999) lastModemMv = minMv;
-      return false;
-    }
-    delay(3000);
+    delay(1000);
   }
   if (minMv < 9999) lastModemMv = minMv;
   Serial.printf("[LTE] Tensión mínima del SIM800 buscando red: %d mV\n", lastModemMv);
@@ -3964,13 +4380,11 @@ bool waitForNetworkMonitored(uint32_t timeoutMs) {
 
 bool sendDataLTE(String jsonData) {
   Serial.println("\n[LTE] Iniciando envío de datos...");
-  dashStep("MODEM", "encendiendo");
-  lastSignal[0] = '\0';
-  mdiagReset();
-  lastModemMv = -1;
 
-  // Encender modem
-  modemPowerOn();
+  // Encender modem (si readSensors() ya lo encendió para el RS485, solo se
+  // completa el tiempo de arranque que falte)
+  if (!modemPoweredOn) modemSessionBegin();
+  modemPowerOnFinish();
 
   // Inicializar modem: arranque largo + estabilización del enlace (ver
   // modemStabilize()) y hasta MODEM_INIT_TRIES init sin cortar alimentación.
@@ -3978,7 +4392,7 @@ bool sendDataLTE(String jsonData) {
   // parpadear) y se repite. Las pruebas AT de diagnóstico van al final.
   bool linkOk = modemStabilize();
   if (!linkOk || !modemInitRetries()) {
-    mdiagShow("M7 CORTE", linkOk ? "init fallo" : "sin AT", "reinicio");
+    mdiagShow("M7 CORTE", "Reinicio de modem", linkOk ? "init fallo" : "sin AT");
     modemRestart();
     linkOk = modemStabilize();
     if (!linkOk || !modemInitRetries()) {
@@ -4005,16 +4419,17 @@ bool sendDataLTE(String jsonData) {
   if (lastModemMv >= SIM800_VMAX_MV) {
     // Se sigue intentando (puede alcanzar a enviar), pero se avisa y se deja
     // ver 2 s: el SIM800 se apagará solo en cuanto pase su umbral.
-    mdiagShow("M7 SOBREV!", "Vsim " + String(lastModemMv / 1000.0f, 2) + "V", "max 4.40V");
+    mdiagShow("M7 SOBREV!", "Voltaje muy alto!", "Vsim " + String(lastModemMv / 1000.0f, 2) + "V max 4.40V");
     delay(2000);
   }
-  mdiagShow("M7 INIT OK", "Vmod " + (lastModemMv > 0 ? String(lastModemMv / 1000.0f, 2) + "V" : String("--")),
-            "Bmin " + String(mdiag.vBatMin, 2));
+  mdiagShow("M7 INIT OK", "Modem listo",
+            "Vmod " + (lastModemMv > 0 ? String(lastModemMv / 1000.0f, 2) + "V" : String("--")) +
+            " Bmin " + String(mdiag.vBatMin, 2));
 
   // Esperar red
   Serial.println("[LTE] Esperando red...");
-  dashStep("RED", "buscando");
-  mdiagShow("M8 RED", "buscando", "");
+  dashStep("RED");
+  mdiagShow("M8 RED", "Buscando senal");
   if (!waitForNetworkMonitored(60000L)) {
     Serial.println("[ERROR] Sin registro en la red");
     if (strcmp(lastNetStatus, "Modem se apago") != 0 && strcmp(lastNetStatus, "Registro denegado") != 0 &&
@@ -4029,12 +4444,13 @@ bool sendDataLTE(String jsonData) {
   snprintf(lastSignal, sizeof(lastSignal), "CSQ %d", csq);
   Serial.printf("[LTE] Red conectada (CSQ %d)\n", csq);
   dash.bars = csqToBars(csq);
-  oledLog("OK CSQ " + String(csq));
+  static const char *const quality[] = {"nula", "debil", "regular", "buena", "excelente"};
+  oledLog(String("Senal ") + quality[csqToBars(csq)]);
 
   // Conectar GPRS
   Serial.println("[LTE] Conectando GPRS...");
-  dashStep("GPRS", RUNapn);
-  mdiagShow("M9 GPRS", RUNapn, "");
+  dashStep("INTERNET");
+  mdiagShow("M9 GPRS", "Conectando", RUNapn);
   if (!modem.gprsConnect(RUNapn.c_str())) {
     Serial.println("[ERROR] Fallo conexión GPRS");
     setNetStatus("Fallo GPRS");
@@ -4050,14 +4466,14 @@ bool sendDataLTE(String jsonData) {
   String topicPub = readFile(SPIFFS, "/topicPub.txt");
 
   if (serverIP == "") serverIP = broker;
-  if (topicPub == "") topicPub = "jhpAI/FAUNA/data";
+  if (topicPub == "") topicPub = "jhpAI/HIDROMET/data";
 
   simclient.setServer(serverIP.c_str(), mqtt_port);
   // El buffer por defecto de PubSubClient (256 B, incluye topic y cabecera)
   // no alcanza para el JSON con campos RS485: publish() fallaría en silencio.
   simclient.setBufferSize(768);
-  dashStep("MQTT", serverIP);
-  mdiagShow("M10 MQTT", serverIP, "");
+  dashStep("SERVIDOR");
+  mdiagShow("M10 MQTT", "Conectando", serverIP);
 
   // Conectar a MQTT
   int mqttRetries = 0;
@@ -4078,8 +4494,7 @@ bool sendDataLTE(String jsonData) {
   if (!simclient.connected()) {
     Serial.println("[ERROR] No se pudo conectar a MQTT");
     setNetStatus("Fallo MQTT");
-    modem.gprsDisconnect();
-    modemPowerOff();
+    modemPowerOff();  // AT+CPOWD ya hace el detach de GPRS
     modemDiagFail("MQTT");
     return false;
   }
@@ -4095,7 +4510,7 @@ bool sendDataLTE(String jsonData) {
   // Reenviar primero cualquier lectura pendiente de ciclos anteriores sin
   // conexión, en orden cronológico, antes del dato de este ciclo.
   int pendingLTE = countPendingRecords();
-  dashStep("ENVIO", pendingLTE > 0 ? "+" + String(pendingLTE) + " pend." : "");
+  dashStep("ENVIANDO", pendingLTE > 0 ? "+" + String(pendingLTE) + " previos" : "");
   flushPendingData(simclient, topicPub);
 
   // Publicar datos
@@ -4114,19 +4529,20 @@ bool sendDataLTE(String jsonData) {
   delay(100);
 
   if (published) {
-    oledLog("esperando config");
+    oledLog("Esperando ajustes");
     waitForConfig(simclient);
-    if (configReceivedFlag) oledLog("config OK");
+    if (configReceivedFlag) oledLog("Ajustes recibidos");
   }
 
   // Desconectar
+  // Sin gprsDisconnect(): AT+CIPSHUT + AT+CGATT=0 tardan 1-3 s con el modem
+  // encendido y AT+CPOWD (modemPowerOff) ya se desregistra de la red.
   simclient.disconnect();
-  modem.gprsDisconnect();
   modemPowerOff();
 
   Serial.println("[LTE] Desconectado");
-  dash.modem = "M OK CSQ" + String(csq);
-  oledLog("modem off");
+  dash.modem = "";
+  oledLog("Modem apagado");
 
   return published;
 }
@@ -4174,12 +4590,12 @@ bool sendDataWiFi(String jsonData) {
   String topicPub = readFile(SPIFFS, "/topicPub.txt");
 
   if (serverIP == "") serverIP = broker;
-  if (topicPub == "") topicPub = "jhpAI/FAUNA/data";
+  if (topicPub == "") topicPub = "jhpAI/HIDROMET/data";
 
   wificlient.setServer(serverIP.c_str(), mqtt_port);
   // Ver nota en sendDataLTE(): buffer por defecto de 256 B insuficiente.
   wificlient.setBufferSize(768);
-  dashStep("MQTT", serverIP);
+  dashStep("SERVIDOR", "Conectando");
 
   // Conectar a MQTT
   int mqttRetries = 0;
@@ -4216,7 +4632,7 @@ bool sendDataWiFi(String jsonData) {
   // Reenviar primero cualquier lectura pendiente de ciclos anteriores sin
   // conexión, en orden cronológico, antes del dato de este ciclo.
   int pendingWiFi = countPendingRecords();
-  dashStep("ENVIO", pendingWiFi > 0 ? "+" + String(pendingWiFi) + " pend." : "");
+  dashStep("ENVIANDO", pendingWiFi > 0 ? "+" + String(pendingWiFi) + " previos" : "");
   flushPendingData(wificlient, topicPub);
 
   // Publicar datos
@@ -4235,9 +4651,9 @@ bool sendDataWiFi(String jsonData) {
   delay(100);
 
   if (published) {
-    oledLog("esperando config");
+    oledLog("Esperando ajustes");
     waitForConfig(wificlient);
-    if (configReceivedFlag) oledLog("config OK");
+    if (configReceivedFlag) oledLog("Ajustes recibidos");
   }
 
   // Desconectar
@@ -4309,13 +4725,17 @@ void init_running() {
     readConfig();
     opCycleCount++;
 
-    // 80 MHz ahorra ~20-30 mA durante el ciclo, pero en LTE se mantiene la
-    // frecuencia por defecto (240 MHz) como en PROD (a603f7a), que conectaba:
-    // tras bajar a 80 MHz aparecieron bytes corruptos en el UART del SIM800.
-    if (connectionType != "LTE") {
-      Serial.flush();  // cambiar la frecuencia con bytes en el FIFO del UART los corrompe
-      setCpuFrequencyMhz(80);
-    }
+    // 80 MHz ahorra ~20-30 mA durante sensores/SD. La sesión con el SIM800
+    // sube a 240 MHz como en PROD (a603f7a), que conectaba (tras bajar a
+    // 80 MHz aparecieron bytes corruptos en su UART): ver modemPowerOnFinish().
+    Serial.flush();  // cambiar la frecuencia con bytes en el FIFO del UART los corrompe
+    setCpuFrequencyMhz(80);
+
+    // Batería en reposo (modem apagado, sin carga de RF): decide si el modem
+    // puede encenderse sin tirar el sistema y si hay que alargar el sleep.
+    // Se mide antes de los sensores para decidir ya si este ciclo envía.
+    cycleBatV = vBat().toFloat();
+    String skip = connectionType == "DATALOGER" ? "" : networkSkipReason();
 
     // OLED del ciclo: si está habilitado (/oledOp.txt) o ya activo (ciclo
     // manual desde la consulta de estado). Mantiene v_sensor encendido
@@ -4339,9 +4759,6 @@ void init_running() {
     logToSD(sensorData);
     dashStep("SD", sdReady ? "registrado" : "no detectada");
 
-    // Batería en reposo (modem apagado, sin carga de RF): decide si el modem
-    // puede encenderse sin tirar el sistema y si hay que alargar el sleep.
-    cycleBatV = vBat().toFloat();
     if (cycleBatV >= BAT_VALID_MIN_V && cycleBatV < BAT_MODEM_MIN_V) {
       oledLog("bat baja " + String(cycleBatV, 2) + "V");
     }
@@ -4354,7 +4771,6 @@ void init_running() {
       setNetStatus("Solo SD (datalogger)");
     } else {
       bool success = false;
-      String skip = networkSkipReason();
 
       if (skip != "") {
         Serial.println("[POWER] Envío omitido este ciclo: " + skip);
@@ -4372,6 +4788,10 @@ void init_running() {
         netFailStreak = success ? 0 : netFailStreak + 1;
         saveSetting(String(netFailStreak), "/netFail.txt");
       }
+
+      if (modemPoweredOn) modemPowerOff();  // por si algún camino lo dejó encendido
+      Serial.flush();
+      setCpuFrequencyMhz(80);  // resumen OLED / sleep: no hace falta 240 MHz
 
       lastCycleSent = success;
       if (success) {
@@ -4414,7 +4834,7 @@ void readConfig() {
   dirSensorType = (dirSensor == "AS5600") ? "AS5600" : "MT6701";
   oledOpEnabled = (readFile(SPIFFS, "/oledOp.txt") != "0");
   String rs485Cfg = readFile(SPIFFS, "/rs485.txt");
-  rs485Type = (rs485Cfg == "SOIL" || rs485Cfg == "RAD") ? rs485Cfg : "NONE";
+  rs485Type = rs485Norm(rs485Cfg);
 
   netFailStreak = readFile(SPIFFS, "/netFail.txt").toInt();
 
@@ -4609,27 +5029,32 @@ void updateSensCache() {
     sensCache.rainCount = "NA";
   }
 
-  // RS485: lectura bloqueante (~2-3 s, energiza el 12V y con él el SIM800),
+  // RS485: lectura bloqueante (~2-3 s; el nivel ACLT600 ~10 s la primera vez,
+  // luego el 12V queda encendido en modo config),
   // así que solo cada 30 s y no en cada vuelta de loop().
   static unsigned long lastRs485Read = 0;
   if (rs485Type == "NONE") {
-    sensCache.rsT = sensCache.rsH = sensCache.rsEC = sensCache.rsPH = sensCache.rsRad = "NA";
+    sensCache.rsT = sensCache.rsH = sensCache.rsEC = sensCache.rsPH = sensCache.rsRad = sensCache.rsLv = "NA";
     sensCache.rs485 = "NA";
+    if (rs485RailOnMs && !rs485Busy) rs485RailOff();  // se deshabilitó con el 12V encendido
   } else if (lastRs485Read == 0 || millis() - lastRs485Read >= 30000) {
     Rs485Data rs;
-    if (readRS485(rs)) {
+    if (readRS485(rs, true)) {
       if (rs485Type == "SOIL") {
         sensCache.rsT  = String(rs.soilT, 1);
         sensCache.rsH  = String(rs.soilH, 1);
         sensCache.rsEC = String(rs.ec);
         sensCache.rsPH = String(rs.ph, 1);
         sensCache.rs485 = "T " + sensCache.rsT + "°C H " + sensCache.rsH + "% EC " + sensCache.rsEC + " pH " + sensCache.rsPH;
+      } else if (rs485Type == "LEVEL") {
+        sensCache.rsLv = String(rs.level, 1);
+        sensCache.rs485 = "Nivel " + sensCache.rsLv + " (crudo)";
       } else {
         sensCache.rsRad = String(rs.rad);
         sensCache.rs485 = sensCache.rsRad + " W/m²";
       }
     } else {
-      sensCache.rsT = sensCache.rsH = sensCache.rsEC = sensCache.rsPH = sensCache.rsRad = "error";
+      sensCache.rsT = sensCache.rsH = sensCache.rsEC = sensCache.rsPH = sensCache.rsRad = sensCache.rsLv = "error";
       sensCache.rs485 = "Sin respuesta";
     }
     lastRs485Read = millis();
@@ -4663,8 +5088,8 @@ void createDefaultConfigs() {
     {"/passString.txt", ""},
     {"/server.txt", ""},
     {"/port.txt", "8000"},
-    {"/topicPub.txt", "jhpAI/FAUNA/data"},
-    {"/topicSub.txt", "jhpAI/FAUNA/settings"},
+    {"/topicPub.txt", "jhpAI/HIDROMET/data"},
+    {"/topicSub.txt", "jhpAI/HIDROMET/settings"},
     {"/status.txt", "1"},
     {"/timeBaseEpoch.txt", "0"},
     {"/timeBaseRtc.txt", "0"}
@@ -4678,6 +5103,13 @@ void createDefaultConfigs() {
       writeFile(SPIFFS, configs[i].path, configs[i].defaultValue);
     }
   }
+
+  // Migración: los topics por defecto pasaron de FAUNA a HIDROMET. Solo se
+  // reemplaza el valor por defecto antiguo; un topic personalizado se respeta.
+  if (readFile(SPIFFS, "/topicPub.txt") == "jhpAI/FAUNA/data")
+    writeFile(SPIFFS, "/topicPub.txt", "jhpAI/HIDROMET/data");
+  if (readFile(SPIFFS, "/topicSub.txt") == "jhpAI/FAUNA/settings")
+    writeFile(SPIFFS, "/topicSub.txt", "jhpAI/HIDROMET/settings");
 
   Serial.println("[INIT] Archivos de configuración verificados\n");
 }
@@ -4695,6 +5127,9 @@ void createDefaultConfigs() {
 extern "C" void initVariant() {
   pinMode(MODEM_PWR_PIN, OUTPUT);
   digitalWrite(MODEM_PWR_PIN, MODEM_PWR_OFF);
+  // GPIO14 (12V RS485) también emite señal durante el arranque: apagarlo ya.
+  pinMode(RS485_PWR_PIN, OUTPUT);
+  digitalWrite(RS485_PWR_PIN, RS485_PWR_OFF);
 }
 
 /* ================== MAIN SETUP ==================*/
@@ -4712,6 +5147,7 @@ void setup() {
   gpio_hold_dis((gpio_num_t)SENS_PWR_PIN);
   gpio_hold_dis((gpio_num_t)PIN_TX2);
   gpio_hold_dis((gpio_num_t)PIN_RX2);
+  gpio_hold_dis((gpio_num_t)RS485_PWR_PIN);
 
   // ===== ASEGURAR MODEM Y SENSORES APAGADOS =====
   // Modem: MODEM_PWR_OFF (LOW, por el NPN Q4). Sensores: MOSFET canal P,
@@ -4722,6 +5158,9 @@ void setup() {
 
   pinMode(SENS_PWR_PIN, OUTPUT);
   digitalWrite(SENS_PWR_PIN, HIGH);
+
+  pinMode(RS485_PWR_PIN, OUTPUT);
+  digitalWrite(RS485_PWR_PIN, RS485_PWR_OFF);
 
   // RX2/TX2 a LOW por defecto hasta que modemPowerOn() los reconfigure
   // como UART: evita retroalimentar el SIM800 (ver modemLinesOff()).
